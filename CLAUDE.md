@@ -41,36 +41,54 @@ Go module `github.com/Nichax-sk/safeinsiam`, `go 1.27.3`.
 
 Layout:
 
-- `main.go`: loads config, opens the DB pool, sets up the Gin router (`gin.Logger`, `gin.Recovery`, trusted proxies disabled), and shuts down gracefully on SIGINT/SIGTERM (10s timeout).
-- `internal/config/config.go`: reads environment variables. It loads `../.env` relative to the working directory, and variables already set in the environment take precedence.
-- `internal/database/postgres.go`: `NewPostgresPool` with MaxConns 10, MinConns 2, MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m. It pings the database on startup.
+- `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
+- `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
+- `internal/app/router.go`: the Gin router (slog request logger, `gin.Recovery`, trusted proxies disabled), the `/health` handlers, and the mapping from `APP_ENV` to Gin mode.
+- `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
+- `internal/database/postgres.go`: `NewPostgresPool` builds the pgx config from a `net/url` URL (never a formatted DSN), sets `application_name` and `statement_timeout`, and pings with bounded retry: 5 attempts, backoff 0.5s→4s, cancelled by `ctx`. MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m.
+- `internal/logging/logging.go`: `log/slog` logger. Text in development and test, JSON in staging and production.
 
 Routes:
 
 - `GET /health`: liveness check
 - `GET /health/db`: pings the database (3s timeout); returns 503 if it can't connect
 
-The server listens on `127.0.0.1:${APP_PORT}` (default 8080).
+The server listens on `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8080`).
+
+`APP_ENV` behavior:
+
+| `APP_ENV` | Gin mode | Log format | Default `LOG_LEVEL` |
+|---|---|---|---|
+| `development` | debug | text | debug |
+| `test` | test | text | info |
+| `staging`, `production` | release | JSON | info |
 
 Environment variables `config.go` reads (the same names as the root `.env` and Docker Compose):
 
 | Variable | Default | Required |
 |---|---|---|
-| `APP_ENV` | `development` (loaded but not used yet) | no |
+| `APP_ENV` | `development` (`development`, `test`, `staging` or `production`) | no |
+| `APP_HOST` | `127.0.0.1` | no |
 | `APP_PORT` | `8080` | no |
+| `LOG_LEVEL` | `debug` in development, otherwise `info` | no |
+| `SHUTDOWN_TIMEOUT` | `10s` | no |
 | `DB_HOST` | `127.0.0.1` | no |
 | `POSTGRES_PORT` | `5432` | no |
 | `POSTGRES_DB` | none | yes |
 | `POSTGRES_USER` | none | yes |
 | `POSTGRES_PASSWORD` | none | yes |
-| `DB_SSLMODE` | `disable` | no |
+| `DB_SSLMODE` | `disable` (production requires `require`, `verify-ca` or `verify-full`) | no |
+| `DB_MAX_CONNS` | `10` | no |
+| `DB_MIN_CONNS` | `2` | no |
+| `DB_STATEMENT_TIMEOUT` | `30s` (`0` disables it) | no |
+| `ENV_FILE` | `../.env`. Process env only, and an error if set in production | no |
 
 ## 4. Environment configuration
 
 - **The root `.env` is the single source of truth.** Docker Compose and the Go backend both read it and use the same variable names (`POSTGRES_*`, `DB_HOST`, `DB_SSLMODE`, `APP_ENV`, `APP_PORT`).
 - **The root `.env.example` is the setup template.** Copy it to `.env` only if the root `.env` does not exist yet, then replace the placeholder `POSTGRES_PASSWORD` with a secure password. Never overwrite an existing `.env`: it may hold the user's real local credentials. See Section 6 for the full local development steps.
 - `backend/.env.example` lists the same keys for reference. The backend doesn't load a `backend/.env`.
-- The backend loads `../.env` relative to its working directory, so it **must be started from `backend/`**. Variables already set in the process environment override values from the file.
+- The backend loads `../.env` relative to its working directory, so it **must be started from `backend/`** (or set `ENV_FILE` to the file's path). Non-empty variables already set in the process environment override values from the file. No env file is read when `APP_ENV=production`. `APP_ENV=production` must come from the process environment; if it is read from an env file, startup fails.
 - `.env` is gitignored. Never commit, stage, print, or overwrite it.
 
 ## 5. Database
@@ -104,7 +122,7 @@ docker compose up -d
 
 ```bash
 cd backend
-go run .
+go run ./cmd/api
 ```
 
 The backend has to run from `backend/` because it loads `../.env` relative to its working directory.
@@ -128,7 +146,8 @@ Local URLs:
 
 - Backend: `cd backend && go build ./...` (`/backend/bin/` is gitignored if you need an output directory)
 - Frontend: `npm run build`, `npm run generate`, `npm run preview`
-- **Tests:** none exist yet. There are no Go `_test.go` files and no frontend test framework or script.
+- **Backend tests:** `cd backend && go test -race ./...`. These are unit tests only; none need a database (config, logging, pool config and retry, router and health handlers, serve and shutdown). There are no integration tests yet.
+- **Frontend tests:** none. There is no test framework or script.
 - **Linting:** no lint script yet. `@nuxt/eslint` is installed but isn't in `nuxt.config.ts` modules, and there's no `eslint.config.*`.
 
 ## 8. Coding conventions (as seen in the existing code)
@@ -136,7 +155,7 @@ Local URLs:
 - Go: application packages live under `backend/internal/`.
 - Go: wrap errors with context, e.g. `fmt.Errorf("create database pool: %w", err)`.
 - Go: put a `context.WithTimeout` on every DB call (health ping 3s, startup ping 5s).
-- Go: read configuration only from env vars, using `getEnv(key, fallback)` for optional values and failing fast when a required value is missing.
+- Go: read configuration only through `internal/config`. Add new variables in `config.parse` using its `get(key, fallback)` helper, and validate them there: append each problem to the collected errors, which are returned together through `errors.Join`. Keep validation centralized in `parse`, never include secret values in errors, and pass other packages typed config structs (e.g. `config.Database`).
 - Frontend: style with Tailwind utility classes. No other frontend conventions exist yet.
 
 ## 9. Git workflow and safety rules
@@ -152,6 +171,6 @@ Local URLs:
 
 ## 10. Known issues
 
-1. The backend loads `../.env` relative to the working directory, and a missing file is silently ignored. If you start it from anywhere other than `backend/`, it fails with "database configuration is incomplete".
+1. The backend loads `../.env` relative to the working directory, and a missing default file is silently ignored. If you start it from anywhere other than `backend/` without setting `ENV_FILE`, it fails with "POSTGRES_DB is required" (and similar errors).
 2. `@nuxt/eslint` is installed but not configured.
 3. `frontend/README.md` is still the Nuxt starter template.
