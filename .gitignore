@@ -1,0 +1,50 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE and editor
+.idea/
+.fleet/
+.vscode/
+
+# Temporary files
+.history/
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Node.js / Nuxt
+node_modules/
+.nuxt/
+.nitro/
+.output/
+.data/
+dist/
+coverage/
+.npm/
+
+# Go build artifacts
+/backend/bin/
+/backend/vendor/
+*.exe
+*.test
+*.out
+
+# Docker / database local files
+*.pid
+*.sock
+
+
+# Local backups and audit reports
+*.backup
+npm-audit.json
