@@ -39,10 +39,12 @@ func NewRouter(opts Options) (*Router, error) {
 	engine := gin.New()
 	engine.HandleMethodNotAllowed = true
 	// requestID runs first so the ID and its response header exist before
-	// anything else. requestLogger wraps recovery so a recovered panic is
-	// still logged exactly once.
+	// anything else. securityHeaders then sets the global security headers
+	// before any handler can write. requestLogger wraps recovery so a
+	// recovered panic is still logged exactly once.
 	engine.Use(
 		requestID(),
+		securityHeaders(),
 		requestLogger(opts.Logger, opts.DebugRoutes),
 		recovery(opts.Logger),
 	)

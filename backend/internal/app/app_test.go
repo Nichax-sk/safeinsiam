@@ -340,3 +340,57 @@ func TestNewHandlerPropagatesRouterError(t *testing.T) {
 		t.Errorf("newHandler error = %v, want NewRouter's %v", err, routerErr)
 	}
 }
+
+var wantSecurityHeaders = map[string]string{
+	"X-Content-Type-Options":  "nosniff",
+	"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+	"X-Frame-Options":         "DENY",
+}
+
+func TestHandlerHealthSecurityHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		pingErr    error
+		wantStatus int
+	}{
+		{"health", health.PathLive, nil, http.StatusOK},
+		{"db unavailable", health.PathDB, errors.New("down"), http.StatusServiceUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, _ := handlerWithLog(t, fakePinger{err: tt.pingErr})
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			for name, want := range wantSecurityHeaders {
+				if values := rec.Header().Values(name); len(values) != 1 || values[0] != want {
+					t.Errorf("%s = %q, want exactly [%q]", name, values, want)
+				}
+			}
+		})
+	}
+}
+
+// Trailing-slash redirects bypass the middleware chain, so they carry no
+// security headers (documented gap).
+func TestHandlerTrailingSlashRedirectHasNoSecurityHeaders(t *testing.T) {
+	handler, _ := handlerWithLog(t, fakePinger{})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, health.PathLive+"/", nil))
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+	for name := range wantSecurityHeaders {
+		if values := rec.Header().Values(name); len(values) != 0 {
+			t.Errorf("%s = %q, want absent on the redirect", name, values)
+		}
+	}
+}

@@ -44,9 +44,10 @@ Layout:
 - `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
 - `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
   `app.go` also maps `APP_ENV` to Gin mode and builds the HTTP handler in `newHandler`: the router with `DebugRoutes: health.Routes`, plus `health.Register(router.Engine, db)`.
-- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then the slog request logger, then panic recovery. It also disables trusted proxies, sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
+- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then security headers, then the slog request logger, then panic recovery. It also disables trusted proxies, sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
 - `internal/httpapi/requestid.go`: the request ID middleware and `RequestIDFromContext(ctx)`.
 - `internal/httpapi/recovery.go`: slog-based panic recovery, which replaces `gin.Recovery`.
+- `internal/httpapi/security.go`: `securityHeaders()`, the only code that sets the global security headers.
 - `internal/httpapi/errors.go`, `respond.go`: the API error type (`Error`, `NewError`, `Code`), `WriteJSON` and `WriteError`.
 - `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes at `PathLive` (`/health`) and `PathDB` (`/health/db`). `Routes` lists both, for logging configuration.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
@@ -106,9 +107,25 @@ Panic recovery (in `recovery.go`):
 - **Never logged:** the panic value's text. Recovery never calls `Error()`, `String()` or any formatting method on a recovered value (application types can implement them, including `runtime.Error`, and may leak secrets or panic). Headers, query strings and bodies aren't logged either.
 - **`http.ErrAbortHandler`:** a panic that is or wraps it is re-panicked as the bare sentinel, so `net/http` aborts the connection silently. It produces no logs.
 
+Security headers (in `security.go`): every response written through the middleware chain carries exactly one of each:
+
+- `X-Content-Type-Options: nosniff`
+- `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
+- `X-Frame-Options: DENY`
+
+That covers success, errors, 404/405, `HEAD`, empty bodies and recovered panics. `securityHeaders()` sets them before any handler runs, right after the request ID middleware.
+
+- **Scope:** the CSP and `X-Frame-Options` are defense in depth for this backend's responses only. They do **not** secure the separate Nuxt frontend; its security headers belong to the frontend and its hosting.
+- **Not set by the backend:**
+  - `Strict-Transport-Security`, which belongs at the TLS-terminating proxy. The app serves plain HTTP and trusts no proxies.
+  - `Referrer-Policy` and `Permissions-Policy`, which don't apply to JSON responses.
+  - `Cache-Control`, to be decided per route when feature routes arrive.
+- **Ownership:** a test fails if any non-test Go file other than `security.go` names these headers.
+
 Known gaps:
 
-- **Trailing-slash redirects** (e.g. `/health/` → `/health`): Gin writes these before any middleware runs, so they have no `X-Request-ID` and no log entry.
+- **Trailing-slash redirects** (e.g. `/health/` → `/health`): Gin writes these before any middleware runs, so they have no `X-Request-ID`, no security headers and no log entry.
+- **`net/http` protocol errors** (e.g. a malformed request's 400, or 431 for oversized headers): `net/http` writes these before the handler runs, so they carry no security headers or request ID.
 
 The server listens on `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8080`).
 
@@ -213,6 +230,7 @@ Local URLs:
 - Go: wrap errors with context, e.g. `fmt.Errorf("create database pool: %w", err)`.
 - Go: put a `context.WithTimeout` on every DB call (health ping 3s, startup ping 5s).
 - Go HTTP: register versioned API routes on `router.V1` and send every error response through `httpapi.WriteError`. Return client errors as `httpapi.NewError(code, message)`; the HTTP status is derived from the code. Any other error becomes a 500 `internal_error` with a fixed message. Don't log errors in handlers: `WriteError` records 5xx causes for the request logger, which logs each request once. Read the request ID with `httpapi.RequestIDFromContext(ctx)`; never generate one elsewhere.
+- Go HTTP security headers: only `securityHeaders()` in `internal/httpapi/security.go` sets `X-Content-Type-Options`, `Content-Security-Policy` and `X-Frame-Options`. Handlers and helpers must not set, change or remove them. Change the policy only by editing `security.go`, as a reviewed change; never override it per handler.
 - Go: read configuration only through `internal/config`. Add new variables in `config.parse` using its `get(key, fallback)` helper, and validate them there: append each problem to the collected errors, which are returned together through `errors.Join`. Keep validation centralized in `parse`, never include secret values in errors, and pass other packages typed config structs (e.g. `config.Database`).
 - Frontend: style with Tailwind utility classes. No other frontend conventions exist yet.
 
