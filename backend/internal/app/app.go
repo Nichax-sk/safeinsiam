@@ -14,6 +14,8 @@ import (
 
 	"github.com/Nichax-sk/safeinsiam/internal/config"
 	"github.com/Nichax-sk/safeinsiam/internal/database"
+	"github.com/Nichax-sk/safeinsiam/internal/health"
+	"github.com/Nichax-sk/safeinsiam/internal/httpapi"
 )
 
 const (
@@ -36,13 +38,14 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	defer dbPool.Close()
 	logger.Info("database connected")
 
-	router, err := newRouter(logger, dbPool)
+	router, err := httpapi.NewRouter(httpapi.Options{Logger: logger})
 	if err != nil {
 		return fmt.Errorf("configure router: %w", err)
 	}
+	health.Register(router.Engine, dbPool)
 
 	server := &http.Server{
-		Handler:           router,
+		Handler:           router.Engine,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -63,6 +66,17 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	)
 
 	return serve(ctx, server, listener, cfg.HTTP.ShutdownTimeout, logger)
+}
+
+func ginMode(env config.Env) string {
+	switch env {
+	case config.EnvDevelopment:
+		return gin.DebugMode
+	case config.EnvTest:
+		return gin.TestMode
+	default:
+		return gin.ReleaseMode
+	}
 }
 
 // serve runs server on listener until ctx is cancelled or the server fails,

@@ -43,7 +43,10 @@ Layout:
 
 - `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
 - `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
-- `internal/app/router.go`: the Gin router (slog request logger, `gin.Recovery`, trusted proxies disabled), the `/health` handlers, and the mapping from `APP_ENV` to Gin mode.
+  `app.go` also maps `APP_ENV` to Gin mode and wires routes: `health.Register(router.Engine, dbPool)`.
+- `internal/httpapi/router.go`: `NewRouter(Options{Logger})` returns `Router{Engine, V1}`. It sets up the shared middleware (slog request logger, `gin.Recovery`, trusted proxies disabled), JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
+- `internal/httpapi/errors.go`, `respond.go`: the API error type (`Error`, `NewError`, `Code`), `WriteJSON` and `WriteError`.
+- `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
 - `internal/database/postgres.go`: `NewPostgresPool` builds the pgx config from a `net/url` URL (never a formatted DSN), sets `application_name` and `statement_timeout`, and pings with bounded retry: 5 attempts, backoff 0.5s→4s, cancelled by `ctx`. MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m.
 - `internal/logging/logging.go`: `log/slog` logger. Text in development and test, JSON in staging and production.
@@ -52,6 +55,17 @@ Routes:
 
 - `GET /health`: liveness check
 - `GET /health/db`: pings the database (3s timeout); returns 503 if it can't connect
+- `/api/v1/*`: no routes yet
+
+The health responses (`{"status":…,"message":…}`) predate the error envelope and are kept unchanged for compatibility. Every other error response, including 404 and 405, uses the envelope:
+
+```json
+{"error":{"code":"not_found","message":"Resource not found","request_id":"","details":[]}}
+```
+
+`request_id` is empty until request ID middleware is added. Codes and statuses: `bad_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 404, `method_not_allowed` 405, `conflict` 409, `payload_too_large` 413, `unsupported_media_type` 415, `validation_failed` 422, `too_many_requests` 429, `internal_error` 500, `service_unavailable` 503.
+
+Access log: exactly one entry per request (`method`, `route` (the route template, or the path when unmatched), `status`, `latency`, `client_ip`, `bytes`). The level is Info below 500 and Error from 500. For 5xx responses written by `WriteError` it adds `error_code` and `error_type` (the Go type names in the error chain). It never logs error text, query strings, headers or request bodies.
 
 The server listens on `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8080`).
 
@@ -155,6 +169,7 @@ Local URLs:
 - Go: application packages live under `backend/internal/`.
 - Go: wrap errors with context, e.g. `fmt.Errorf("create database pool: %w", err)`.
 - Go: put a `context.WithTimeout` on every DB call (health ping 3s, startup ping 5s).
+- Go HTTP: register versioned API routes on `router.V1` and send every error response through `httpapi.WriteError`. Return client errors as `httpapi.NewError(code, message)`; the HTTP status is derived from the code. Any other error becomes a 500 `internal_error` with a fixed message. Don't log errors in handlers: `WriteError` records 5xx causes for the request logger, which logs each request once.
 - Go: read configuration only through `internal/config`. Add new variables in `config.parse` using its `get(key, fallback)` helper, and validate them there: append each problem to the collected errors, which are returned together through `errors.Join`. Keep validation centralized in `parse`, never include secret values in errors, and pass other packages typed config structs (e.g. `config.Database`).
 - Frontend: style with Tailwind utility classes. No other frontend conventions exist yet.
 

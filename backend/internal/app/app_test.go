@@ -3,13 +3,42 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/Nichax-sk/safeinsiam/internal/config"
 )
+
+func TestMain(m *testing.M) {
+	gin.SetMode(gin.TestMode)
+	os.Exit(m.Run())
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestGinMode(t *testing.T) {
+	tests := map[config.Env]string{
+		config.EnvDevelopment: gin.DebugMode,
+		config.EnvTest:        gin.TestMode,
+		config.EnvStaging:     gin.ReleaseMode,
+		config.EnvProduction:  gin.ReleaseMode,
+	}
+
+	for env, want := range tests {
+		if got := ginMode(env); got != want {
+			t.Errorf("ginMode(%s) = %s, want %s", env, got, want)
+		}
+	}
+}
 
 func listenLocal(t *testing.T) net.Listener {
 	t.Helper()
