@@ -216,7 +216,7 @@ func handlerWithLog(t *testing.T, db health.Pinger) (http.Handler, *bytes.Buffer
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	handler, err := newHandler(logger, db)
+	handler, err := newHandler(logger, config.HTTP{}, db)
 	if err != nil {
 		t.Fatalf("newHandler: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestNewHandlerPropagatesRouterError(t *testing.T) {
 		t.Fatal("NewRouter accepted a nil logger")
 	}
 
-	handler, err := newHandler(nil, fakePinger{})
+	handler, err := newHandler(nil, config.HTTP{}, fakePinger{})
 	if handler != nil {
 		t.Error("newHandler returned a handler alongside an error")
 	}
@@ -392,5 +392,47 @@ func TestHandlerTrailingSlashRedirectHasNoSecurityHeaders(t *testing.T) {
 		if values := rec.Header().Values(name); len(values) != 0 {
 			t.Errorf("%s = %q, want absent on the redirect", name, values)
 		}
+	}
+}
+
+func TestHandlerAppliesCORSConfig(t *testing.T) {
+	const origin = "http://localhost:3000"
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	handler, err := newHandler(logger, config.HTTP{CORSAllowedOrigins: []string{origin}}, fakePinger{})
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, health.PathLive, nil)
+	req.Header.Set("Origin", origin)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != origin {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, origin)
+	}
+}
+
+func TestHandlerAppliesTrustedProxies(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	handler, err := newHandler(logger, config.HTTP{TrustedProxies: []string{"10.0.0.0/8"}}, fakePinger{})
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, health.PathLive, nil)
+	req.RemoteAddr = "10.1.2.3:4567"
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	entries := logLines(t, &buf)
+	if len(entries) != 1 || entries[0]["client_ip"] != "203.0.113.7" {
+		t.Errorf("log entries = %v, want one with client_ip 203.0.113.7", entries)
 	}
 }

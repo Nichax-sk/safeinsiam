@@ -2,8 +2,11 @@ package config
 
 import (
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,7 +60,7 @@ func TestParseDefaults(t *testing.T) {
 			StatementTimeout: 30 * time.Second,
 		},
 	}
-	if *cfg != want {
+	if !reflect.DeepEqual(*cfg, want) {
 		t.Errorf("parse defaults:\n got %+v\nwant %+v", *cfg, want)
 	}
 }
@@ -438,5 +441,273 @@ func TestLoadProductionRejectsEnvFile(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "ENV_FILE") {
 		t.Fatalf("Load error = %v, want ENV_FILE rejection", err)
+	}
+}
+
+func parseHTTP(t *testing.T, extra map[string]string) (HTTP, error) {
+	t.Helper()
+
+	cfg, err := parse(lookupFrom(requiredVars(extra)))
+	if err != nil {
+		return HTTP{}, err
+	}
+	return cfg.HTTP, nil
+}
+
+func TestParseCORSAndProxiesDisabledByDefault(t *testing.T) {
+	httpCfg, err := parseHTTP(t, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if httpCfg.CORSAllowedOrigins != nil || httpCfg.TrustedProxies != nil {
+		t.Errorf("CORS origins = %v, proxies = %v; want both nil",
+			httpCfg.CORSAllowedOrigins, httpCfg.TrustedProxies)
+	}
+}
+
+func TestParseCORSOriginsCanonicalizes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{"http://localhost:3000", []string{"http://localhost:3000"}},
+		{"http://localhost:80", []string{"http://localhost"}},
+		{"https://example.test:443", []string{"https://example.test"}},
+		{"HTTPS://Example.TEST:443/", []string{"https://example.test"}},
+		{"https://example.test:8443", []string{"https://example.test:8443"}},
+		{"http://example.test:443", []string{"http://example.test:443"}},
+		{"https://example.test:80", []string{"https://example.test:80"}},
+		{"http://[::1]:80", []string{"http://[::1]"}},
+		{"http://[::1]:3000", []string{"http://[::1]:3000"}},
+		{"http://LOCALHOST:3000/", []string{"http://localhost:3000"}},
+		{"http://localhost:3000,http://LOCALHOST:3000/", []string{"http://localhost:3000"}},
+		{" http://a.test , https://b.test:8443 ,", []string{"http://a.test", "https://b.test:8443"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			httpCfg, err := parseHTTP(t, map[string]string{"CORS_ALLOWED_ORIGINS": tt.input})
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if !slices.Equal(httpCfg.CORSAllowedOrigins, tt.want) {
+				t.Errorf("origins = %v, want %v", httpCfg.CORSAllowedOrigins, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseCORSOriginsRejectsInvalid(t *testing.T) {
+	for _, input := range []string{
+		"*", "null", "NULL", "http://*.example.test",
+		"http://localhost:3000/app", "http://localhost:3000?x=1", "http://localhost:3000#x",
+		"http://user:pass@localhost:3000", "ftp://localhost", "localhost:3000",
+		"example.test", "http://", "http://localhost:0", "http://localhost:70000",
+	} {
+		t.Run(input, func(t *testing.T) {
+			_, err := parseHTTP(t, map[string]string{"CORS_ALLOWED_ORIGINS": input})
+			if err == nil || !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+				t.Errorf("parse error = %v, want CORS_ALLOWED_ORIGINS rejection", err)
+			}
+		})
+	}
+}
+
+func TestParseCORSOriginsProductionRequiresHTTPS(t *testing.T) {
+	production := map[string]string{"APP_ENV": "production", "DB_SSLMODE": "require"}
+
+	production["CORS_ALLOWED_ORIGINS"] = "http://app.example.test"
+	if _, err := parseHTTP(t, production); err == nil ||
+		!strings.Contains(err.Error(), "https in production") {
+		t.Errorf("parse error = %v, want https-in-production rejection", err)
+	}
+
+	production["CORS_ALLOWED_ORIGINS"] = "https://app.example.test"
+	httpCfg, err := parseHTTP(t, production)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !slices.Equal(httpCfg.CORSAllowedOrigins, []string{"https://app.example.test"}) {
+		t.Errorf("origins = %v", httpCfg.CORSAllowedOrigins)
+	}
+}
+
+func TestParseTrustedProxiesCanonicalizes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{"10.0.0.0/8", []string{"10.0.0.0/8"}},
+		{"172.16.0.0/12,192.168.1.10", []string{"172.16.0.0/12", "192.168.1.10/32"}},
+		{"fd00::/8", []string{"fd00::/8"}},
+		{"2001:db8::1", []string{"2001:db8::1/128"}},
+		// IPv4-mapped forms are written as IPv4, as net.IPNet.Contains sees them.
+		{"::ffff:10.0.0.0/104", []string{"10.0.0.0/8"}},
+		{"::ffff:192.0.2.7", []string{"192.0.2.7/32"}},
+		// Incomplete coverage stays valid.
+		{"0.0.0.0/1", []string{"0.0.0.0/1"}},
+		{"0.0.0.0/1,192.0.0.0/2", []string{"0.0.0.0/1", "192.0.0.0/2"}},
+		{"::/1", []string{"::/1"}},
+		{"::/1,c000::/2", []string{"::/1", "c000::/2"}},
+		{"0.0.0.0/1,8000::/1", []string{"0.0.0.0/1", "8000::/1"}},
+		{"10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8",
+			[]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			httpCfg, err := parseHTTP(t, map[string]string{"TRUSTED_PROXIES": tt.input})
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if !slices.Equal(httpCfg.TrustedProxies, tt.want) {
+				t.Errorf("proxies = %v, want %v", httpCfg.TrustedProxies, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTrustedProxiesRejectsInvalid(t *testing.T) {
+	for _, input := range []string{"nope", "10.0.0.0/33", "1.2.3", "10.0.0.0/8,garbage"} {
+		t.Run(input, func(t *testing.T) {
+			_, err := parseHTTP(t, map[string]string{"TRUSTED_PROXIES": input})
+			if err == nil || !strings.Contains(err.Error(), "invalid TRUSTED_PROXIES entry") {
+				t.Errorf("parse error = %v, want an invalid-entry error", err)
+			}
+		})
+	}
+}
+
+func TestParseTrustedProxiesRejectsTrustAll(t *testing.T) {
+	tests := []struct {
+		input  string
+		family string
+	}{
+		// Single entries (R2).
+		{"0.0.0.0/0", "IPv4"},
+		{"::/0", "IPv6"},
+		{"::ffff:0:0/96", "IPv4"},
+		{"::ffff:0.0.0.0/96", "IPv4"},
+		// Aggregate coverage (R4).
+		{"0.0.0.0/1,128.0.0.0/1", "IPv4"},
+		{"128.0.0.0/1,0.0.0.0/1", "IPv4"},
+		{"::/1,8000::/1", "IPv6"},
+		{"0.0.0.0/2,64.0.0.0/2,128.0.0.0/1", "IPv4"},
+		{"::ffff:0:0/97,::ffff:128.0.0.0/97", "IPv4"},
+		{"0.0.0.0/1,10.0.0.0/8,128.0.0.0/1", "IPv4"},
+		{"::/1,8000::/1,10.0.0.0/8", "IPv6"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			_, err := parseHTTP(t, map[string]string{"TRUSTED_PROXIES": tt.input})
+			want := "covers all " + tt.family + " addresses"
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("parse error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+// The trust-all rule targets what Gin actually trusts: each rejected single
+// network really does contain every address of its family per Contains.
+func TestTrustAllNetworksMatchContains(t *testing.T) {
+	for _, cidr := range []string{"0.0.0.0/0", "::ffff:0:0/96", "::ffff:0.0.0.0/96"} {
+		_, network, _ := net.ParseCIDR(cidr)
+		for _, ip := range []string{"0.0.0.0", "1.2.3.4", "255.255.255.255"} {
+			if !network.Contains(net.ParseIP(ip)) {
+				t.Errorf("%s does not contain %s", cidr, ip)
+			}
+		}
+	}
+	_, all6, _ := net.ParseCIDR("::/0")
+	if !all6.Contains(net.ParseIP("2001:db8::1")) {
+		t.Error("::/0 does not contain 2001:db8::1")
+	}
+}
+
+func TestPrefixTrie(t *testing.T) {
+	half := func(first byte) net.IP { return net.IP{first, 0, 0, 0} }
+
+	var empty prefixNode
+	if empty.covers() {
+		t.Error("empty trie covers")
+	}
+
+	var all prefixNode
+	all.insert(half(0), 0)
+	if !all.covers() {
+		t.Error("/0 does not cover")
+	}
+
+	for _, order := range [][2]byte{{0x00, 0x80}, {0x80, 0x00}} {
+		var trie prefixNode
+		trie.insert(half(order[0]), 1)
+		trie.insert(half(order[1]), 1)
+		if !trie.covers() {
+			t.Errorf("halves inserted in order %v do not cover", order)
+		}
+	}
+
+	var redundant prefixNode
+	redundant.insert(half(0x00), 1)
+	redundant.insert(half(0x0a), 8) // inside 0.0.0.0/1
+	if redundant.covers() || !redundant.child[0].full || redundant.child[0].child[0] != nil {
+		t.Error("a longer prefix under a covered one changed the trie")
+	}
+
+	var replaced prefixNode
+	replaced.insert(half(0x0a), 8)
+	replaced.insert(half(0x00), 1) // replaces the /8 below it
+	replaced.insert(half(0x80), 1)
+	if !replaced.covers() {
+		t.Error("shorter prefixes replacing a longer one do not cover")
+	}
+
+	var deep prefixNode
+	deep.insert(net.ParseIP("2001:db8::1").To16(), 128)
+	if deep.covers() {
+		t.Error("a single /128 covers all IPv6")
+	}
+}
+
+func TestNetworkFamily(t *testing.T) {
+	tests := []struct {
+		cidr       string
+		wantIPv4   bool
+		wantPrefix int
+	}{
+		{"10.0.0.0/8", true, 8},
+		{"::ffff:10.0.0.0/104", true, 8},
+		{"::ffff:0:0/96", true, 0},
+		{"::ffff:0:0/95", false, 95},
+		{"fd00::/8", false, 8},
+	}
+
+	for _, tt := range tests {
+		_, network, err := net.ParseCIDR(tt.cidr)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%s): %v", tt.cidr, err)
+		}
+		_, prefix, isIPv4 := networkFamily(network)
+		if isIPv4 != tt.wantIPv4 || prefix != tt.wantPrefix {
+			t.Errorf("%s: ipv4=%v prefix=%d, want ipv4=%v prefix=%d",
+				tt.cidr, isIPv4, prefix, tt.wantIPv4, tt.wantPrefix)
+		}
+	}
+}
+
+func TestParseReportsCORSAndProxyErrorsTogether(t *testing.T) {
+	_, err := parseHTTP(t, map[string]string{
+		"CORS_ALLOWED_ORIGINS": "*",
+		"TRUSTED_PROXIES":      "0.0.0.0/0",
+	})
+	if err == nil {
+		t.Fatal("parse succeeded")
+	}
+	for _, want := range []string{"CORS_ALLOWED_ORIGINS", "TRUSTED_PROXIES"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
 	}
 }

@@ -38,7 +38,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	defer dbPool.Close()
 	logger.Info("database connected")
 
-	handler, err := newHandler(logger, dbPool)
+	handler, err := newHandler(logger, cfg.HTTP, dbPool)
 	if err != nil {
 		return fmt.Errorf("configure router: %w", err)
 	}
@@ -68,12 +68,14 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 }
 
 // newHandler builds the HTTP handler: the router, with successful health
-// checks logged at Debug, plus the health endpoints. Its only error is
-// NewRouter's.
-func newHandler(logger *slog.Logger, db health.Pinger) (http.Handler, error) {
+// checks logged at Debug and the configured CORS origins and trusted
+// proxies, plus the health endpoints. Its only error is NewRouter's.
+func newHandler(logger *slog.Logger, httpCfg config.HTTP, db health.Pinger) (http.Handler, error) {
 	router, err := httpapi.NewRouter(httpapi.Options{
-		Logger:      logger,
-		DebugRoutes: health.Routes,
+		Logger:             logger,
+		DebugRoutes:        health.Routes,
+		CORSAllowedOrigins: httpCfg.CORSAllowedOrigins,
+		TrustedProxies:     httpCfg.TrustedProxies,
 	})
 	if err != nil {
 		return nil, err

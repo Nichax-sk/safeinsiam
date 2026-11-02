@@ -19,6 +19,12 @@ type Options struct {
 	// DebugRoutes are route templates, such as health checks, whose
 	// successful requests (status < 400) are logged at Debug instead of Info.
 	DebugRoutes []string
+	// CORSAllowedOrigins are canonical origins allowed by the CORS policy.
+	// Empty disables CORS: no CORS middleware is installed.
+	CORSAllowedOrigins []string
+	// TrustedProxies are IPs or CIDRs whose X-Forwarded-For header is
+	// trusted for the client IP. Empty trusts no proxy.
+	TrustedProxies []string
 }
 
 // Router is the HTTP router. Unversioned operational routes, such as health
@@ -40,16 +46,29 @@ func NewRouter(opts Options) (*Router, error) {
 	engine.HandleMethodNotAllowed = true
 	// requestID runs first so the ID and its response header exist before
 	// anything else. securityHeaders then sets the global security headers
-	// before any handler can write. requestLogger wraps recovery so a
-	// recovered panic is still logged exactly once.
-	engine.Use(
+	// before any handler can write. requestLogger wraps cors and recovery so
+	// preflights and recovered panics are still logged exactly once; cors
+	// runs before recovery so a recovered panic's 500 keeps its CORS headers.
+	middleware := []gin.HandlerFunc{
 		requestID(),
 		securityHeaders(),
 		requestLogger(opts.Logger, opts.DebugRoutes),
-		recovery(opts.Logger),
-	)
+	}
+	if len(opts.CORSAllowedOrigins) > 0 {
+		middleware = append(middleware, cors(opts.CORSAllowedOrigins))
+	}
+	middleware = append(middleware, recovery(opts.Logger))
+	engine.Use(middleware...)
 
-	if err := engine.SetTrustedProxies(nil); err != nil {
+	// Only X-Forwarded-For is read, and only from trusted proxies. Nil trusts
+	// no proxy, so forwarded headers are ignored; Gin's own default would
+	// trust every proxy.
+	engine.RemoteIPHeaders = []string{"X-Forwarded-For"}
+	var trustedProxies []string
+	if len(opts.TrustedProxies) > 0 {
+		trustedProxies = opts.TrustedProxies
+	}
+	if err := engine.SetTrustedProxies(trustedProxies); err != nil {
 		return nil, err
 	}
 

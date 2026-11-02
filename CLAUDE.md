@@ -44,10 +44,11 @@ Layout:
 - `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
 - `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
   `app.go` also maps `APP_ENV` to Gin mode and builds the HTTP handler in `newHandler`: the router with `DebugRoutes: health.Routes`, plus `health.Register(router.Engine, db)`.
-- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then security headers, then the slog request logger, then panic recovery. It also disables trusted proxies, sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
+- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes, CORSAllowedOrigins, TrustedProxies})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then security headers, then the slog request logger, then CORS (only when origins are configured), then panic recovery. It also configures trusted proxies (none by default; client IPs read from `X-Forwarded-For` only), sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
 - `internal/httpapi/requestid.go`: the request ID middleware and `RequestIDFromContext(ctx)`.
 - `internal/httpapi/recovery.go`: slog-based panic recovery, which replaces `gin.Recovery`.
 - `internal/httpapi/security.go`: `securityHeaders()`, the only code that sets the global security headers.
+- `internal/httpapi/cors.go`: the CORS middleware and `addVary`.
 - `internal/httpapi/errors.go`, `respond.go`: the API error type (`Error`, `NewError`, `Code`), `WriteJSON` and `WriteError`.
 - `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes at `PathLive` (`/health`) and `PathDB` (`/health/db`). `Routes` lists both, for logging configuration.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
@@ -122,10 +123,36 @@ That covers success, errors, 404/405, `HEAD`, empty bodies and recovered panics.
   - `Cache-Control`, to be decided per route when feature routes arrive.
 - **Ownership:** a test fails if any non-test Go file other than `security.go` names these headers.
 
+CORS (in `cors.go`, installed only when `CORS_ALLOWED_ORIGINS` is set):
+
+- **Origins:** configured origins are canonicalized (lowercase scheme and host, `:80`/`:443` default ports removed, other ports kept). A request matches only if it has exactly one `Origin` header exactly equal to a configured origin; `null`, multiple or comma-joined values never match. The response's `Access-Control-Allow-Origin` is that configured origin, never a reflected header.
+- **Fixed policy:**
+  - Methods: `GET, POST, PUT, PATCH, DELETE`.
+  - Request headers: `Content-Type, X-Request-ID`.
+  - Exposed headers: `X-Request-ID`.
+  - Preflight `Max-Age`: 600.
+  - **Credentials are never allowed.**
+- **Allowed origin, non-preflight:** every response through the chain (including errors, 404/405 and recovered panics) carries `Access-Control-Allow-Origin` and `Access-Control-Expose-Headers`. Preflights are answered separately (below).
+- **Disallowed origin:** the request is served normally without CORS headers, so the browser blocks the read.
+- **Preflight** means `OPTIONS` with an `Origin` header and an `Access-Control-Request-Method` header, even an empty one.
+  - **Valid preflight → 204.** Valid means the origin is allowed; the requested method is a single valid token that exactly (case-sensitively) matches an allowed method; and every requested header is allowed (compared case-insensitively). The 204 carries `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, `Access-Control-Max-Age` and `Vary`, but not `Access-Control-Expose-Headers`.
+  - **Anything else → 403** standard envelope (`forbidden`, "CORS request not allowed"), without `Access-Control-Allow-Origin`.
+  - **`OPTIONS` without `Access-Control-Request-Method`** is an ordinary request (404/405).
+  - **Use uppercase `PATCH` in frontend code:** browsers uppercase most methods but send `patch` as written.
+- **`Vary`:** `Origin` is added to every response (and the two `Access-Control-Request-*` tokens on preflights) without removing existing `Vary` values or duplicating tokens.
+- **CORS is not authorization.** Simple cross-origin requests still reach handlers. CSRF protection belongs with authentication.
+
+Trusted proxies (`TRUSTED_PROXIES`):
+
+- **Empty (the default):** forwarded headers are ignored and the client IP is the connection's remote address. Gin's own default would trust every proxy, so `NewRouter` always sets the list explicitly.
+- **Configured:** the client IP is the rightmost `X-Forwarded-For` entry that isn't a trusted proxy. `X-Real-IP` and other headers are never used.
+- **Validation:** entries are canonicalized to CIDRs (bare IPs become `/32` or `/128`; IPv4-mapped forms become IPv4) so Gin interprets them exactly as validated. Any configuration whose networks **together** cover all IPv4 or all IPv6 addresses is rejected: single entries such as `0.0.0.0/0`, `::/0` or `::ffff:0:0/96`, and combinations such as `0.0.0.0/1,128.0.0.0/1` or `::/1,8000::/1`.
+- **Set it only to the real reverse proxies' addresses.**
+
 Known gaps:
 
-- **Trailing-slash redirects** (e.g. `/health/` → `/health`): Gin writes these before any middleware runs, so they have no `X-Request-ID`, no security headers and no log entry.
-- **`net/http` protocol errors** (e.g. a malformed request's 400, or 431 for oversized headers): `net/http` writes these before the handler runs, so they carry no security headers or request ID.
+- **Trailing-slash redirects** (e.g. `/health/` → `/health`): Gin writes these before any middleware runs, so they have no `X-Request-ID`, no security headers, no CORS headers and no log entry.
+- **`net/http` protocol errors** (e.g. a malformed request's 400, or 431 for oversized headers): `net/http` writes these before the handler runs, so they carry no security headers, CORS headers or request ID.
 
 The server listens on `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8080`).
 
@@ -156,6 +183,8 @@ Environment variables `config.go` reads (the same names as the root `.env` and D
 | `DB_MIN_CONNS` | `2` | no |
 | `DB_STATEMENT_TIMEOUT` | `30s` (`0` disables it) | no |
 | `ENV_FILE` | `../.env`. Process env only, and an error if set in production | no |
+| `CORS_ALLOWED_ORIGINS` | empty (CORS disabled). Comma-separated exact origins; canonicalized; `*` and `null` rejected; `https` required in production | no |
+| `TRUSTED_PROXIES` | empty (trust no proxy). Comma-separated IPs or CIDRs; rejected if together they cover all IPv4 or all IPv6 | no |
 
 ## 4. Environment configuration
 
@@ -231,6 +260,7 @@ Local URLs:
 - Go: put a `context.WithTimeout` on every DB call (health ping 3s, startup ping 5s).
 - Go HTTP: register versioned API routes on `router.V1` and send every error response through `httpapi.WriteError`. Return client errors as `httpapi.NewError(code, message)`; the HTTP status is derived from the code. Any other error becomes a 500 `internal_error` with a fixed message. Don't log errors in handlers: `WriteError` records 5xx causes for the request logger, which logs each request once. Read the request ID with `httpapi.RequestIDFromContext(ctx)`; never generate one elsewhere.
 - Go HTTP security headers: only `securityHeaders()` in `internal/httpapi/security.go` sets `X-Content-Type-Options`, `Content-Security-Policy` and `X-Frame-Options`. Handlers and helpers must not set, change or remove them. Change the policy only by editing `security.go`, as a reviewed change; never override it per handler.
+- Go HTTP `Vary`: handlers that vary responses must use `c.Writer.Header().Add("Vary", …)`, never `Set`, so the CORS `Vary` values are kept.
 - Go: read configuration only through `internal/config`. Add new variables in `config.parse` using its `get(key, fallback)` helper, and validate them there: append each problem to the collected errors, which are returned together through `errors.Join`. Keep validation centralized in `parse`, never include secret values in errors, and pass other packages typed config structs (e.g. `config.Database`).
 - Frontend: style with Tailwind utility classes. No other frontend conventions exist yet.
 
