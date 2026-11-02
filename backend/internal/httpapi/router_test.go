@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -332,12 +331,6 @@ func TestWriteErrorAfterResponseStarted(t *testing.T) {
 }
 
 func TestPanicLoggedOnceAtError(t *testing.T) {
-	// gin.Recovery captures DefaultErrorWriter when the router is built;
-	// discard its output, which this test does not inspect.
-	previous := gin.DefaultErrorWriter
-	gin.DefaultErrorWriter = io.Discard
-	t.Cleanup(func() { gin.DefaultErrorWriter = previous })
-
 	tests := map[string]*http.Request{
 		"inbound ID":   requestWithID(http.MethodGet, "/panic"),
 		"generated ID": httptest.NewRequest(http.MethodGet, "/panic", nil),
@@ -353,11 +346,6 @@ func TestPanicLoggedOnceAtError(t *testing.T) {
 			if rec.Code != http.StatusInternalServerError {
 				t.Errorf("status = %d, want 500", rec.Code)
 			}
-			// gin.Recovery writes no body until custom recovery replaces it.
-			if rec.Body.Len() != 0 {
-				t.Errorf("body = %q, want empty", rec.Body.String())
-			}
-
 			header := rec.Header().Get(RequestIDHeader)
 			if !requestIDPattern.MatchString(header) {
 				t.Errorf("%s = %q, want a valid request ID", RequestIDHeader, header)
@@ -366,12 +354,28 @@ func TestPanicLoggedOnceAtError(t *testing.T) {
 				t.Errorf("%s = %q, want the inbound %q", RequestIDHeader, header, testRequestID)
 			}
 
-			entry := singleEntry(t, buf)
-			if entry["level"] != "ERROR" || entry["status"] != float64(500) {
-				t.Errorf("entry = %v, want ERROR with status 500", entry)
+			want := `{"error":{"code":"internal_error","message":"Internal server error",` +
+				`"request_id":"` + header + `","details":[]}}`
+			if got := rec.Body.String(); got != want {
+				t.Errorf("body = %s\nwant   %s", got, want)
 			}
-			if entry["request_id"] != header {
-				t.Errorf("log request_id = %v, want header %q", entry["request_id"], header)
+
+			// One panic entry plus one access entry, both with the same ID.
+			entries := logEntries(t, buf)
+			if len(entries) != 2 {
+				t.Fatalf("got %d log entries, want 2: %s", len(entries), buf.String())
+			}
+			for _, entry := range entries {
+				if entry["level"] != "ERROR" || entry["request_id"] != header {
+					t.Errorf("entry %v, want ERROR with request_id %q", entry["msg"], header)
+				}
+			}
+			if entries[0]["msg"] != "panic recovered" || entries[1]["msg"] != "http request" {
+				t.Errorf("entry messages = %v, %v; want panic recovered, http request",
+					entries[0]["msg"], entries[1]["msg"])
+			}
+			if entries[1]["status"] != float64(500) {
+				t.Errorf("access entry status = %v, want 500", entries[1]["status"])
 			}
 		})
 	}

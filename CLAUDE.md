@@ -44,8 +44,9 @@ Layout:
 - `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
 - `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
   `app.go` also maps `APP_ENV` to Gin mode and builds the HTTP handler in `newHandler`: the router with `DebugRoutes: health.Routes`, plus `health.Register(router.Engine, db)`.
-- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then the slog request logger, then `gin.Recovery`. It also disables trusted proxies, sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
+- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then the slog request logger, then panic recovery. It also disables trusted proxies, sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
 - `internal/httpapi/requestid.go`: the request ID middleware and `RequestIDFromContext(ctx)`.
+- `internal/httpapi/recovery.go`: slog-based panic recovery, which replaces `gin.Recovery`.
 - `internal/httpapi/errors.go`, `respond.go`: the API error type (`Error`, `NewError`, `Code`), `WriteJSON` and `WriteError`.
 - `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes at `PathLive` (`/health`) and `PathDB` (`/health/db`). `Routes` lists both, for logging configuration.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
@@ -95,9 +96,18 @@ Levels:
 
 For 5xx responses written by `WriteError`, the entry also gets `error_code`, plus `error_type` when there's a cause (the Go type names in the error chain). It never logs error text, query strings, headers or request bodies.
 
+Panic recovery (in `recovery.go`):
+
+- **Response:** a recovered panic gets the standard 500 `internal_error` envelope with the request ID. If the response has already started, it is left unchanged.
+- **Logs:** each panic produces exactly one `"panic recovered"` Error entry plus the request's single access entry (with `error_code=internal_error` and `error_type=httpapi.panicError`). Both carry the same `request_id`.
+- **Panic log fields:** `request_id`, `method`, `route`, `panic_type` and `stack`.
+  - `panic_type` is the value's Go type (`%T`).
+  - `stack` is capped at 16 KiB.
+- **Never logged:** the panic value's text. Recovery never calls `Error()`, `String()` or any formatting method on a recovered value (application types can implement them, including `runtime.Error`, and may leak secrets or panic). Headers, query strings and bodies aren't logged either.
+- **`http.ErrAbortHandler`:** a panic that is or wraps it is re-panicked as the bare sentinel, so `net/http` aborts the connection silently. It produces no logs.
+
 Known gaps:
 
-- **Panics:** `gin.Recovery` returns a 500 with an empty body. The response still has `X-Request-ID`, and the request gets one Error log entry.
 - **Trailing-slash redirects** (e.g. `/health/` → `/health`): Gin writes these before any middleware runs, so they have no `X-Request-ID` and no log entry.
 
 The server listens on `${APP_HOST}:${APP_PORT}` (default `127.0.0.1:8080`).

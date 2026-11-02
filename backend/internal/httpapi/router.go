@@ -44,7 +44,7 @@ func NewRouter(opts Options) (*Router, error) {
 	engine.Use(
 		requestID(),
 		requestLogger(opts.Logger, opts.DebugRoutes),
-		gin.Recovery(),
+		recovery(opts.Logger),
 	)
 
 	if err := engine.SetTrustedProxies(nil); err != nil {
@@ -81,7 +81,6 @@ func requestLogger(logger *slog.Logger, debugRoutes []string) gin.HandlerFunc {
 
 		c.Next()
 
-		route := c.FullPath()
 		status := c.Writer.Status()
 
 		var level slog.Level
@@ -90,19 +89,15 @@ func requestLogger(logger *slog.Logger, debugRoutes []string) gin.HandlerFunc {
 			level = slog.LevelError
 		case status >= http.StatusBadRequest:
 			level = slog.LevelWarn
-		case quiet[route]:
+		case quiet[c.FullPath()]: // matched route templates only
 			level = slog.LevelDebug
 		default:
 			level = slog.LevelInfo
 		}
 
-		if route == "" {
-			route = c.Request.URL.Path
-		}
-
 		attrs := []slog.Attr{
 			slog.String("method", c.Request.Method),
-			slog.String("route", route),
+			slog.String("route", routeOf(c)),
 			slog.Int("status", status),
 			slog.Float64("latency_ms", float64(time.Since(start).Microseconds())/1000),
 			slog.String("client_ip", c.ClientIP()),
@@ -126,4 +121,13 @@ func requestLogger(logger *slog.Logger, debugRoutes []string) gin.HandlerFunc {
 
 		logger.LogAttrs(c.Request.Context(), level, "http request", attrs...)
 	}
+}
+
+// routeOf returns the matched route template, or the path for unmatched
+// routes. It never includes the query string.
+func routeOf(c *gin.Context) string {
+	if route := c.FullPath(); route != "" {
+		return route
+	}
+	return c.Request.URL.Path
 }
