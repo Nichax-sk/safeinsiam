@@ -8,6 +8,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	PathLive = "/health"
+	PathDB   = "/health/db"
+)
+
+// Routes lists the health route templates, for logging configuration.
+var Routes = []string{PathLive, PathDB}
+
 const dbPingTimeout = 3 * time.Second
 
 type Pinger interface {
@@ -17,14 +25,14 @@ type Pinger interface {
 // Register adds GET /health and GET /health/db. Their response bodies predate
 // the API error envelope and are kept unchanged for compatibility.
 func Register(r gin.IRouter, db Pinger) {
-	r.GET("/health", func(c *gin.Context) {
+	r.GET(PathLive, func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "ok",
 			"message": "SafeInSiam API is running",
 		})
 	})
 
-	r.GET("/health/db", func(c *gin.Context) {
+	r.GET(PathDB, func(c *gin.Context) {
 		queryCtx, cancel := context.WithTimeout(
 			c.Request.Context(),
 			dbPingTimeout,

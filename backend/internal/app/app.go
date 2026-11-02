@@ -38,14 +38,13 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	defer dbPool.Close()
 	logger.Info("database connected")
 
-	router, err := httpapi.NewRouter(httpapi.Options{Logger: logger})
+	handler, err := newHandler(logger, dbPool)
 	if err != nil {
 		return fmt.Errorf("configure router: %w", err)
 	}
-	health.Register(router.Engine, dbPool)
 
 	server := &http.Server{
-		Handler:           router.Engine,
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -66,6 +65,22 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	)
 
 	return serve(ctx, server, listener, cfg.HTTP.ShutdownTimeout, logger)
+}
+
+// newHandler builds the HTTP handler: the router, with successful health
+// checks logged at Debug, plus the health endpoints. Its only error is
+// NewRouter's.
+func newHandler(logger *slog.Logger, db health.Pinger) (http.Handler, error) {
+	router, err := httpapi.NewRouter(httpapi.Options{
+		Logger:      logger,
+		DebugRoutes: health.Routes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	health.Register(router.Engine, db)
+
+	return router.Engine, nil
 }
 
 func ginMode(env config.Env) string {

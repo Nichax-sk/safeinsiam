@@ -1,19 +1,26 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/Nichax-sk/safeinsiam/internal/config"
+	"github.com/Nichax-sk/safeinsiam/internal/health"
+	"github.com/Nichax-sk/safeinsiam/internal/httpapi"
 )
 
 func TestMain(m *testing.M) {
@@ -195,5 +202,141 @@ func TestRunReturnsErrorWhenContextCancelledBeforeDatabase(t *testing.T) {
 	err := Run(ctx, cfg, discardLogger())
 	if err == nil {
 		t.Fatal("Run succeeded with a cancelled context")
+	}
+}
+
+type fakePinger struct{ err error }
+
+func (p fakePinger) Ping(context.Context) error { return p.err }
+
+// handlerWithLog builds the real application handler with a Debug-level JSON
+// access log captured in the returned buffer.
+func handlerWithLog(t *testing.T, db health.Pinger) (http.Handler, *bytes.Buffer) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	handler, err := newHandler(logger, db)
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+
+	return handler, &buf
+}
+
+// logLines parses the captured JSON log lines.
+func logLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+
+	var entries []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line is not JSON: %q", line)
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+var validRequestID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+func TestHandlerRequestIDAndLogLevels(t *testing.T) {
+	tests := []struct {
+		name       string
+		path       string
+		inboundID  string
+		pingErr    error
+		wantStatus int
+		wantLevel  string
+	}{
+		{"health generated ID", health.PathLive, "", nil, http.StatusOK, "DEBUG"},
+		{"health inbound ID", health.PathLive, "health-check-1", nil, http.StatusOK, "DEBUG"},
+		{"db healthy", health.PathDB, "", nil, http.StatusOK, "DEBUG"},
+		{"db unavailable", health.PathDB, "", errors.New("down"), http.StatusServiceUnavailable, "ERROR"},
+		{"unknown API route", "/api/v1/x", "", nil, http.StatusNotFound, "WARN"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, buf := handlerWithLog(t, fakePinger{err: tt.pingErr})
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.inboundID != "" {
+				req.Header.Set(httpapi.RequestIDHeader, tt.inboundID)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+
+			header := rec.Header().Get(httpapi.RequestIDHeader)
+			if !validRequestID.MatchString(header) {
+				t.Fatalf("%s = %q, want a valid request ID", httpapi.RequestIDHeader, header)
+			}
+			if tt.inboundID != "" && header != tt.inboundID {
+				t.Errorf("%s = %q, want inbound %q", httpapi.RequestIDHeader, header, tt.inboundID)
+			}
+
+			entries := logLines(t, buf)
+			if len(entries) != 1 {
+				t.Fatalf("got %d log entries, want 1: %s", len(entries), buf.String())
+			}
+			entry := entries[0]
+			if entry["level"] != tt.wantLevel || entry["status"] != float64(tt.wantStatus) {
+				t.Errorf("entry = %v, want level %s with status %d",
+					entry, tt.wantLevel, tt.wantStatus)
+			}
+			if entry["request_id"] != header {
+				t.Errorf("log request_id = %v, want header %q", entry["request_id"], header)
+			}
+			if tt.wantStatus == http.StatusNotFound &&
+				!strings.Contains(rec.Body.String(), `"request_id":"`+header+`"`) {
+				t.Errorf("body %s does not carry request_id %q", rec.Body.String(), header)
+			}
+		})
+	}
+}
+
+// Trailing-slash redirects are written by Gin before any middleware runs, so
+// they carry no request ID and produce no access log entry (unchanged in M2).
+func TestHandlerTrailingSlashRedirectBypassesMiddleware(t *testing.T) {
+	handler, buf := handlerWithLog(t, fakePinger{})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, health.PathLive+"/", nil))
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != health.PathLive {
+		t.Errorf("Location = %q, want %q", got, health.PathLive)
+	}
+	if got := rec.Header().Get(httpapi.RequestIDHeader); got != "" {
+		t.Errorf("%s = %q, want none", httpapi.RequestIDHeader, got)
+	}
+	if entries := logLines(t, buf); len(entries) != 0 {
+		t.Errorf("got %d log entries, want 0", len(entries))
+	}
+}
+
+func TestNewHandlerPropagatesRouterError(t *testing.T) {
+	_, routerErr := httpapi.NewRouter(httpapi.Options{})
+	if routerErr == nil {
+		t.Fatal("NewRouter accepted a nil logger")
+	}
+
+	handler, err := newHandler(nil, fakePinger{})
+	if handler != nil {
+		t.Error("newHandler returned a handler alongside an error")
+	}
+	if err == nil || err.Error() != routerErr.Error() {
+		t.Errorf("newHandler error = %v, want NewRouter's %v", err, routerErr)
 	}
 }

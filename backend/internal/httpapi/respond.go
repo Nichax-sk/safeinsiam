@@ -65,6 +65,9 @@ func WriteError(c *gin.Context, err error) {
 	}
 
 	status, body := normalize(apiErr)
+	if c.Request != nil {
+		body.RequestID = RequestIDFromContext(c.Request.Context())
+	}
 
 	if status >= http.StatusInternalServerError {
 		c.Set(internalErrorKey, &internalError{

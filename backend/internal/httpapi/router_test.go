@@ -14,12 +14,23 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// testRouter returns a router whose access log is captured as JSON lines.
+// testRouter returns a router whose access log is captured as JSON lines at
+// Info level.
 func testRouter(t *testing.T) (*Router, *bytes.Buffer) {
+	t.Helper()
+	return testRouterWith(t, slog.LevelInfo, nil)
+}
+
+// testRouterWith returns a router logging JSON lines at level, with the given
+// debug routes.
+func testRouterWith(t *testing.T, level slog.Level, debugRoutes []string) (*Router, *bytes.Buffer) {
 	t.Helper()
 
 	var buf bytes.Buffer
-	router, err := NewRouter(Options{Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+	router, err := NewRouter(Options{
+		Logger:      slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level})),
+		DebugRoutes: debugRoutes,
+	})
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -70,14 +81,24 @@ func TestNewRouterRequiresLogger(t *testing.T) {
 	}
 }
 
+// testRequestID is a valid inbound request ID, so expected bodies are exact.
+const testRequestID = "test-req-1"
+
+// requestWithID returns a request carrying testRequestID.
+func requestWithID(method, target string) *http.Request {
+	req := httptest.NewRequest(method, target, nil)
+	req.Header.Set(RequestIDHeader, testRequestID)
+	return req
+}
+
 func TestUnknownRouteReturnsJSON404(t *testing.T) {
 	want := `{"error":{"code":"not_found","message":"Resource not found",` +
-		`"request_id":"","details":[]}}`
+		`"request_id":"test-req-1","details":[]}}`
 
 	for _, path := range []string{"/nope", "/api/v1/anything"} {
 		t.Run(path, func(t *testing.T) {
 			router, buf := testRouter(t)
-			rec := serve(router, httptest.NewRequest(http.MethodGet, path, nil))
+			rec := serve(router, requestWithID(http.MethodGet, path))
 
 			if rec.Code != http.StatusNotFound {
 				t.Errorf("status = %d, want 404", rec.Code)
@@ -89,9 +110,16 @@ func TestUnknownRouteReturnsJSON404(t *testing.T) {
 				t.Errorf("body = %s\nwant   %s", got, want)
 			}
 
+			if got := rec.Header().Get(RequestIDHeader); got != testRequestID {
+				t.Errorf("%s = %q, want %q", RequestIDHeader, got, testRequestID)
+			}
+
 			entry := singleEntry(t, buf)
-			if entry["level"] != "INFO" || entry["status"] != float64(404) {
-				t.Errorf("404 log entry = %v, want INFO with status 404", entry)
+			if entry["level"] != "WARN" || entry["status"] != float64(404) {
+				t.Errorf("404 log entry = %v, want WARN with status 404", entry)
+			}
+			if entry["request_id"] != testRequestID {
+				t.Errorf("log request_id = %v, want %q", entry["request_id"], testRequestID)
 			}
 			if _, ok := entry["error_code"]; ok {
 				t.Errorf("404 logged as an internal error: %v", entry)
@@ -104,7 +132,7 @@ func TestUnsupportedMethodReturnsJSON405(t *testing.T) {
 	router, buf := testRouter(t)
 	router.Engine.GET("/thing", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	rec := serve(router, httptest.NewRequest(http.MethodPost, "/thing", nil))
+	rec := serve(router, requestWithID(http.MethodPost, "/thing"))
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
@@ -113,12 +141,16 @@ func TestUnsupportedMethodReturnsJSON405(t *testing.T) {
 		t.Errorf("Allow = %q, want GET", got)
 	}
 	want := `{"error":{"code":"method_not_allowed","message":"Method not allowed",` +
-		`"request_id":"","details":[]}}`
+		`"request_id":"test-req-1","details":[]}}`
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %s\nwant   %s", got, want)
 	}
-	if entry := singleEntry(t, buf); entry["level"] != "INFO" {
-		t.Errorf("405 log level = %v, want INFO", entry["level"])
+	if got := rec.Header().Get(RequestIDHeader); got != testRequestID {
+		t.Errorf("%s = %q, want %q", RequestIDHeader, got, testRequestID)
+	}
+	entry := singleEntry(t, buf)
+	if entry["level"] != "WARN" || entry["request_id"] != testRequestID {
+		t.Errorf("405 log entry = %v, want WARN with request_id %q", entry, testRequestID)
 	}
 }
 
@@ -179,8 +211,8 @@ func TestClientErrorIsNotLoggedAsInternal(t *testing.T) {
 		t.Errorf("status = %d, want 409", rec.Code)
 	}
 	entry := singleEntry(t, buf)
-	if entry["level"] != "INFO" {
-		t.Errorf("level = %v, want INFO", entry["level"])
+	if entry["level"] != "WARN" {
+		t.Errorf("level = %v, want WARN", entry["level"])
 	}
 	for _, key := range []string{"error_code", "error_type"} {
 		if _, ok := entry[key]; ok {
@@ -275,13 +307,17 @@ func TestWriteErrorAfterResponseStarted(t *testing.T) {
 		func(c *gin.Context) { ran = true },
 	)
 
-	rec := serve(router, httptest.NewRequest(http.MethodGet, "/started", nil))
+	rec := serve(router, requestWithID(http.MethodGet, "/started"))
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
 	if got := rec.Body.String(); got != "partial" {
 		t.Errorf("body = %q, want %q", got, "partial")
+	}
+	// The header was set before the handler wrote.
+	if got := rec.Header().Get(RequestIDHeader); got != testRequestID {
+		t.Errorf("%s = %q, want %q", RequestIDHeader, got, testRequestID)
 	}
 	if ran {
 		t.Error("handler after WriteError ran")
@@ -302,17 +338,142 @@ func TestPanicLoggedOnceAtError(t *testing.T) {
 	gin.DefaultErrorWriter = io.Discard
 	t.Cleanup(func() { gin.DefaultErrorWriter = previous })
 
-	router, buf := testRouter(t)
-	router.Engine.GET("/panic", func(c *gin.Context) { panic("boom") })
-
-	rec := serve(router, httptest.NewRequest(http.MethodGet, "/panic", nil))
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want 500", rec.Code)
+	tests := map[string]*http.Request{
+		"inbound ID":   requestWithID(http.MethodGet, "/panic"),
+		"generated ID": httptest.NewRequest(http.MethodGet, "/panic", nil),
 	}
+
+	for name, req := range tests {
+		t.Run(name, func(t *testing.T) {
+			router, buf := testRouter(t)
+			router.Engine.GET("/panic", func(c *gin.Context) { panic("boom") })
+
+			rec := serve(router, req)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want 500", rec.Code)
+			}
+			// gin.Recovery writes no body until custom recovery replaces it.
+			if rec.Body.Len() != 0 {
+				t.Errorf("body = %q, want empty", rec.Body.String())
+			}
+
+			header := rec.Header().Get(RequestIDHeader)
+			if !requestIDPattern.MatchString(header) {
+				t.Errorf("%s = %q, want a valid request ID", RequestIDHeader, header)
+			}
+			if req.Header.Get(RequestIDHeader) != "" && header != testRequestID {
+				t.Errorf("%s = %q, want the inbound %q", RequestIDHeader, header, testRequestID)
+			}
+
+			entry := singleEntry(t, buf)
+			if entry["level"] != "ERROR" || entry["status"] != float64(500) {
+				t.Errorf("entry = %v, want ERROR with status 500", entry)
+			}
+			if entry["request_id"] != header {
+				t.Errorf("log request_id = %v, want header %q", entry["request_id"], header)
+			}
+		})
+	}
+}
+
+func TestInternalErrorRequestIDMatchesEverywhere(t *testing.T) {
+	router, buf := testRouter(t)
+	router.Engine.GET("/fail", func(c *gin.Context) { WriteError(c, errors.New("x")) })
+
+	rec := serve(router, httptest.NewRequest(http.MethodGet, "/fail", nil))
+
+	header := rec.Header().Get(RequestIDHeader)
+	if !requestIDPattern.MatchString(header) {
+		t.Fatalf("%s = %q, want a valid request ID", RequestIDHeader, header)
+	}
+
+	var body struct {
+		Error struct {
+			RequestID string `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	if body.Error.RequestID != header {
+		t.Errorf("body request_id = %q, want header %q", body.Error.RequestID, header)
+	}
+	if entry := singleEntry(t, buf); entry["request_id"] != header {
+		t.Errorf("log request_id = %v, want header %q", entry["request_id"], header)
+	}
+}
+
+func TestRequestLoggerLevels(t *testing.T) {
+	const debugRoute = "/probe"
+
+	tests := []struct {
+		name      string
+		route     string
+		status    int
+		wantLevel string
+	}{
+		{"2xx", "/ok", http.StatusOK, "INFO"},
+		{"3xx", "/ok", http.StatusFound, "INFO"},
+		{"4xx", "/ok", http.StatusNotFound, "WARN"},
+		{"5xx", "/ok", http.StatusServiceUnavailable, "ERROR"},
+		{"debug route 2xx", debugRoute, http.StatusOK, "DEBUG"},
+		{"debug route 4xx", debugRoute, http.StatusNotFound, "WARN"},
+		{"debug route 5xx", debugRoute, http.StatusServiceUnavailable, "ERROR"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, buf := testRouterWith(t, slog.LevelDebug, []string{debugRoute})
+			router.Engine.GET(tt.route, func(c *gin.Context) { c.Status(tt.status) })
+
+			serve(router, httptest.NewRequest(http.MethodGet, tt.route, nil))
+
+			entry := singleEntry(t, buf)
+			if entry["level"] != tt.wantLevel || entry["status"] != float64(tt.status) {
+				t.Errorf("entry = %v, want level %s with status %d",
+					entry, tt.wantLevel, tt.status)
+			}
+		})
+	}
+}
+
+func TestDebugRouteSuccessHiddenAtInfoLevel(t *testing.T) {
+	router, buf := testRouterWith(t, slog.LevelInfo, []string{"/probe"})
+	router.Engine.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	serve(router, httptest.NewRequest(http.MethodGet, "/probe", nil))
+
+	if entries := logEntries(t, buf); len(entries) != 0 {
+		t.Errorf("got %d log entries at Info level, want 0: %v", len(entries), entries)
+	}
+}
+
+func TestRequestLoggerLatencyAndBytes(t *testing.T) {
+	router, buf := testRouter(t)
+	router.Engine.GET("/json", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	router.Engine.GET("/empty", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	rec := serve(router, httptest.NewRequest(http.MethodGet, "/json", nil))
 	entry := singleEntry(t, buf)
-	if entry["level"] != "ERROR" || entry["status"] != float64(500) {
-		t.Errorf("entry = %v, want ERROR with status 500", entry)
+
+	latency, ok := entry["latency_ms"].(float64)
+	if !ok || latency < 0 {
+		t.Errorf("latency_ms = %v, want a non-negative number", entry["latency_ms"])
+	}
+	if _, ok := entry["latency"]; ok {
+		t.Errorf("entry still has the old latency field: %v", entry)
+	}
+	if entry["bytes"] != float64(rec.Body.Len()) {
+		t.Errorf("bytes = %v, want %d", entry["bytes"], rec.Body.Len())
+	}
+
+	buf.Reset()
+	serve(router, httptest.NewRequest(http.MethodGet, "/empty", nil))
+	if entry := singleEntry(t, buf); entry["bytes"] != float64(0) {
+		t.Errorf("bytes for an empty response = %v, want 0", entry["bytes"])
 	}
 }
 

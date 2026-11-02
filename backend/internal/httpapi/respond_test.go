@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -49,6 +50,23 @@ func TestWriteErrorEnvelope(t *testing.T) {
 	}
 	if !c.IsAborted() {
 		t.Error("WriteError did not abort the request")
+	}
+}
+
+func TestWriteErrorUsesRequestIDFromContext(t *testing.T) {
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Request = req.WithContext(
+		context.WithValue(req.Context(), requestIDKey{}, "ctx-req-7"),
+	)
+
+	WriteError(c, NewError(CodeConflict, ""))
+
+	want := `{"error":{"code":"conflict","message":"Resource conflict",` +
+		`"request_id":"ctx-req-7","details":[]}}`
+	if got := rec.Body.String(); got != want {
+		t.Errorf("body = %s\nwant   %s", got, want)
 	}
 }
 

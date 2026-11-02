@@ -16,6 +16,9 @@ const APIV1Prefix = "/api/v1"
 type Options struct {
 	// Logger receives one access log entry per request. Required.
 	Logger *slog.Logger
+	// DebugRoutes are route templates, such as health checks, whose
+	// successful requests (status < 400) are logged at Debug instead of Info.
+	DebugRoutes []string
 }
 
 // Router is the HTTP router. Unversioned operational routes, such as health
@@ -35,7 +38,14 @@ func NewRouter(opts Options) (*Router, error) {
 
 	engine := gin.New()
 	engine.HandleMethodNotAllowed = true
-	engine.Use(requestLogger(opts.Logger), gin.Recovery())
+	// requestID runs first so the ID and its response header exist before
+	// anything else. requestLogger wraps recovery so a recovered panic is
+	// still logged exactly once.
+	engine.Use(
+		requestID(),
+		requestLogger(opts.Logger, opts.DebugRoutes),
+		gin.Recovery(),
+	)
 
 	if err := engine.SetTrustedProxies(nil); err != nil {
 		return nil, err
@@ -55,35 +65,50 @@ func NewRouter(opts Options) (*Router, error) {
 	}, nil
 }
 
-// requestLogger logs exactly one structured entry per request: Info below
-// 500 and Error from 500. It logs the route template (or the path for
-// unmatched routes) and never the query string, headers, or body. For 5xx
-// responses written by WriteError it adds error_code and error_type, never
-// the error text.
-func requestLogger(logger *slog.Logger) gin.HandlerFunc {
+// requestLogger logs exactly one structured entry per request: Error for
+// 5xx, Warn for 4xx, Debug for successful requests to debugRoutes, and Info
+// otherwise. It logs the route template (or the path for unmatched routes)
+// and never the query string, headers, or body. For 5xx responses written by
+// WriteError it adds error_code and error_type, never the error text.
+func requestLogger(logger *slog.Logger, debugRoutes []string) gin.HandlerFunc {
+	quiet := make(map[string]bool, len(debugRoutes))
+	for _, route := range debugRoutes {
+		quiet[route] = true
+	}
+
 	return func(c *gin.Context) {
 		start := time.Now()
 
 		c.Next()
 
 		route := c.FullPath()
-		if route == "" {
-			route = c.Request.URL.Path
+		status := c.Writer.Status()
+
+		var level slog.Level
+		switch {
+		case status >= http.StatusInternalServerError:
+			level = slog.LevelError
+		case status >= http.StatusBadRequest:
+			level = slog.LevelWarn
+		case quiet[route]:
+			level = slog.LevelDebug
+		default:
+			level = slog.LevelInfo
 		}
 
-		status := c.Writer.Status()
-		level := slog.LevelInfo
-		if status >= http.StatusInternalServerError {
-			level = slog.LevelError
+		if route == "" {
+			route = c.Request.URL.Path
 		}
 
 		attrs := []slog.Attr{
 			slog.String("method", c.Request.Method),
 			slog.String("route", route),
 			slog.Int("status", status),
-			slog.Duration("latency", time.Since(start)),
+			slog.Float64("latency_ms", float64(time.Since(start).Microseconds())/1000),
 			slog.String("client_ip", c.ClientIP()),
-			slog.Int("bytes", c.Writer.Size()),
+			// Size is -1 when no body was written.
+			slog.Int("bytes", max(c.Writer.Size(), 0)),
+			slog.String("request_id", RequestIDFromContext(c.Request.Context())),
 		}
 
 		if status >= http.StatusInternalServerError {

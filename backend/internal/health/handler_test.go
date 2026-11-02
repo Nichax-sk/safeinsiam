@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -72,19 +73,19 @@ func TestHealthEndpointsCompatibility(t *testing.T) {
 	}{
 		{
 			name:       "liveness",
-			path:       "/health",
+			path:       health.PathLive,
 			wantStatus: http.StatusOK,
 			wantBody:   `{"message":"SafeInSiam API is running","status":"ok"}`,
 		},
 		{
 			name:       "database healthy",
-			path:       "/health/db",
+			path:       health.PathDB,
 			wantStatus: http.StatusOK,
 			wantBody:   `{"message":"Database connection is healthy","status":"ok"}`,
 		},
 		{
 			name:       "database unavailable",
-			path:       "/health/db",
+			path:       health.PathDB,
 			pingErr:    errors.New("connection refused"),
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   `{"message":"Database connection unavailable","status":"error"}`,
@@ -117,7 +118,7 @@ func TestHealthDBPingTimeoutIsThreeSeconds(t *testing.T) {
 	handler := newRouter(t, db)
 
 	before := time.Now()
-	get(t, handler, "/health/db")
+	get(t, handler, health.PathDB)
 	after := time.Now()
 
 	if !db.hasDeadline {
@@ -133,12 +134,12 @@ func TestHealthDBPingTimeoutIsThreeSeconds(t *testing.T) {
 }
 
 func TestHealthTrailingSlashRedirects(t *testing.T) {
-	rec := get(t, newRouter(t, &fakePinger{}), "/health/")
+	rec := get(t, newRouter(t, &fakePinger{}), health.PathLive+"/")
 
 	if rec.Code != http.StatusMovedPermanently {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusMovedPermanently)
 	}
-	if got := rec.Header().Get("Location"); got != "/health" {
+	if got := rec.Header().Get("Location"); got != health.PathLive {
 		t.Errorf("Location = %q, want /health", got)
 	}
 }
@@ -148,7 +149,7 @@ func TestHealthUnsupportedMethodReturnsJSON405(t *testing.T) {
 		t.Run(method, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			newRouter(t, &fakePinger{}).ServeHTTP(
-				rec, httptest.NewRequest(method, "/health/db", nil),
+				rec, httptest.NewRequest(method, health.PathDB, nil),
 			)
 
 			if rec.Code != http.StatusMethodNotAllowed {
@@ -161,5 +162,18 @@ func TestHealthUnsupportedMethodReturnsJSON405(t *testing.T) {
 				t.Errorf("Content-Type = %q, want %q", got, jsonContentType)
 			}
 		})
+	}
+}
+
+// The paths are part of the public contract; the constants must not drift.
+func TestHealthPathsAndRoutes(t *testing.T) {
+	if health.PathLive != "/health" {
+		t.Errorf("PathLive = %q, want /health", health.PathLive)
+	}
+	if health.PathDB != "/health/db" {
+		t.Errorf("PathDB = %q, want /health/db", health.PathDB)
+	}
+	if want := []string{health.PathLive, health.PathDB}; !slices.Equal(health.Routes, want) {
+		t.Errorf("Routes = %v, want %v", health.Routes, want)
 	}
 }
