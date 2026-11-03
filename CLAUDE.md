@@ -44,15 +44,17 @@ Layout:
 - `cmd/api/main.go`: entrypoint. Loads config, builds the logger, sets up SIGINT/SIGTERM handling (a second signal force-quits), calls `app.Run`, and is the only place that calls `os.Exit`.
 - `internal/app/app.go`: `Run(ctx, cfg, logger) error` wires the DB pool and router, listens synchronously (so a port conflict returns an error), serves until `ctx` is cancelled, drains in-flight requests within `SHUTDOWN_TIMEOUT`, then closes the pool. The HTTP server timeouts are constants: read header 5s, read 15s, write 30s, idle 60s, max header 1 MiB.
   `app.go` also maps `APP_ENV` to Gin mode and builds the HTTP handler in `newHandler`: the router with `DebugRoutes: health.Routes`, plus `health.Register(router.Engine, db)`.
-- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes, CORSAllowedOrigins, TrustedProxies})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then security headers, then the slog request logger, then CORS (only when origins are configured), then panic recovery. It also configures trusted proxies (none by default; client IPs read from `X-Forwarded-For` only), sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages.
+- `internal/httpapi/router.go`: `NewRouter(Options{Logger, DebugRoutes, CORSAllowedOrigins, TrustedProxies})` returns `Router{Engine, V1}`. It sets up the shared middleware in this order: request ID, then security headers, then the slog request logger, then CORS (only when origins are configured), then panic recovery. It also configures trusted proxies (none by default; client IPs read from `X-Forwarded-For` only), sets up JSON 404 (`NoRoute`) and 405 (`NoMethod`, with Gin's `Allow` header), and creates the empty `/api/v1` group (`V1`) where versioned API routes register. `httpapi` never imports feature packages; it imports `internal/database` only to map database errors.
 - `internal/httpapi/requestid.go`: the request ID middleware and `RequestIDFromContext(ctx)`.
 - `internal/httpapi/recovery.go`: slog-based panic recovery, which replaces `gin.Recovery`.
 - `internal/httpapi/security.go`: `securityHeaders()`, the only code that sets the global security headers.
 - `internal/httpapi/cors.go`: the CORS middleware and `addVary`.
 - `internal/httpapi/errors.go`, `respond.go`: the API error type (`Error`, `NewError`, `Code`), `WriteJSON` and `WriteError`.
+- `internal/httpapi/dberror.go`: `DatabaseError(err)`, which maps classified database errors to API errors.
 - `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes at `PathLive` (`/health`) and `PathDB` (`/health/db`). `Routes` lists both, for logging configuration.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
 - `internal/database/postgres.go`: `NewPostgresPool` builds the pgx config from a `net/url` URL (never a formatted DSN), sets `application_name` and `statement_timeout`, and pings with bounded retry: 5 attempts, backoff 0.5s→4s, cancelled by `ctx`. MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m.
+- `internal/database/errors.go`: `Classify` and `IsRetryable` for pgx/PostgreSQL errors (see Database errors below).
 - `internal/logging/logging.go`: `log/slog` logger. Text in development and test, JSON in staging and production.
 
 Routes:
@@ -148,6 +150,26 @@ Trusted proxies (`TRUSTED_PROXIES`):
 - **Configured:** the client IP is the rightmost `X-Forwarded-For` entry that isn't a trusted proxy. `X-Real-IP` and other headers are never used.
 - **Validation:** entries are canonicalized to CIDRs (bare IPs become `/32` or `/128`; IPv4-mapped forms become IPv4) so Gin interprets them exactly as validated. Any configuration whose networks **together** cover all IPv4 or all IPv6 addresses is rejected: single entries such as `0.0.0.0/0`, `::/0` or `::ffff:0:0/96`, and combinations such as `0.0.0.0/1,128.0.0.0/1` or `::/1,8000::/1`.
 - **Set it only to the real reverse proxies' addresses.**
+
+Database errors (`database/errors.go`, `httpapi/dberror.go`):
+
+- **`database.Classify(err)`** returns a `Kind` (unknown, not_found, conflict, contention, unavailable, timeout, canceled), `Retryable` and the `SQLState`. It inspects the error chain and uses exact SQLSTATE codes (PostgreSQL 17 Appendix A; no prefix or message matching). It never wraps or changes the error.
+- **Order:** nil/typed-nil chain → context cancel → timeout (deadline, `pgconn.Timeout`, timeout `net.Error`) → `*pgconn.PgError` → `pgx.ErrNoRows` → `*pgconn.ConnectError`/`ErrConnClosed`/`pgconn.SafeToRetry` → unknown. A chain holding a typed-nil error or a cycle, or exceeding the search budget, is unknown.
+- **Search budget** (`Classify` and `DatabaseError` alike): identified errors (pointers, maps, channels) count once per identity, so shared references are counted once; errors without a stable identity, such as non-pointer values, count on every visit. The search stops when the total counted visits exceed 256.
+- **Retryable** means retrying the whole operation unchanged may succeed and is known not to duplicate effects. Only:
+  - `40001`, `40P01`, `55P03` (ERROR level, so the transaction is aborted) and `57P05` (idle session);
+  - `57P03` and `53300`, **only** with a `*pgconn.ConnectError` in the chain (session startup);
+  - a `*pgconn.ConnectError` with no `PgError` in its chain, or `pgconn.SafeToRetry`.
+
+  Not retryable: class 08 (`08000`–`08007`), `57P01`, `57P02`, `53000`, `53200`, `40003`, `57014`, other timeouts and network errors. Unknown codes and errors are not marked retryable.
+- **No automatic retries.** `IsRetryable` only reports; the startup ping's own bounded retry is separate and unchanged.
+- **`httpapi.DatabaseError(err)`** maps for `WriteError`: not_found → 404, conflict (`23505`, `23503`, `23P01`, `23001`) → 409, contention/unavailable/timeout/canceled → 503 `service_unavailable`, unknown (including `23502`, `23514`, `22xxx`) → 500. It uses default messages and no details, and keeps the error as the cause.
+- **Existing API errors:** `DatabaseError` first searches the chain, depth first in `errors.As` order, for a non-nil `*httpapi.Error`, and returns the error unchanged if it finds one.
+  - Shared identified errors are searched once.
+  - The search stops on a cycle, or when it exceeds the search budget.
+  - If the search stops before finding an `*httpapi.Error`, `DatabaseError` wraps the original error as `internal_error`.
+- **Disclosure:** raw error and driver text are never written to request logs or API responses: no PostgreSQL messages, details, hints, SQL, schema/table/column/constraint names, hosts or users. 5xx request-log entries represent the error only by its `error_code` and the Go type names in its chain.
+  - **Exception, startup logs:** `database not ready, retrying` and the final startup error print pgx error text. It can include the DB host, user and database name, but never the password.
 
 Known gaps:
 
@@ -261,6 +283,7 @@ Local URLs:
 - Go HTTP: register versioned API routes on `router.V1` and send every error response through `httpapi.WriteError`. Return client errors as `httpapi.NewError(code, message)`; the HTTP status is derived from the code. Any other error becomes a 500 `internal_error` with a fixed message. Don't log errors in handlers: `WriteError` records 5xx causes for the request logger, which logs each request once. Read the request ID with `httpapi.RequestIDFromContext(ctx)`; never generate one elsewhere.
 - Go HTTP security headers: only `securityHeaders()` in `internal/httpapi/security.go` sets `X-Content-Type-Options`, `Content-Security-Policy` and `X-Frame-Options`. Handlers and helpers must not set, change or remove them. Change the policy only by editing `security.go`, as a reviewed change; never override it per handler.
 - Go HTTP `Vary`: handlers that vary responses must use `c.Writer.Header().Add("Vary", …)`, never `Set`, so the CORS `Vary` values are kept.
+- Go database errors: send them through `httpapi.WriteError(c, httpapi.DatabaseError(err))`, or return your own `httpapi.NewError` when the handler knows better. Never put driver text (`PgError` fields, SQL, connection details) in messages or `Details`, and don't classify by error strings: use `database.Classify`.
 - Go: read configuration only through `internal/config`. Add new variables in `config.parse` using its `get(key, fallback)` helper, and validate them there: append each problem to the collected errors, which are returned together through `errors.Join`. Keep validation centralized in `parse`, never include secret values in errors, and pass other packages typed config structs (e.g. `config.Database`).
 - Frontend: style with Tailwind utility classes. No other frontend conventions exist yet.
 
