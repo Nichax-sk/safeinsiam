@@ -57,6 +57,8 @@ Layout:
 - `internal/database/errors.go`: `Classify` and `IsRetryable` for pgx/PostgreSQL errors (see Database errors below).
 - `internal/logging/logging.go`: `log/slog` logger. Text in development and test, JSON in staging and production.
 
+CI (`.github/workflows/ci.yml`, Backend job) runs vet, unit tests, integration tests (against a `postgres:17-alpine` service) and the build; see section 7.
+
 Routes:
 
 - `GET /health`: liveness check
@@ -271,7 +273,13 @@ Local URLs:
 
 - Backend: `cd backend && go build ./...` (`/backend/bin/` is gitignored if you need an output directory)
 - Frontend: `npm run build`, `npm run generate`, `npm run preview`
-- **Backend tests:** `cd backend && go test -race ./...`. These are unit tests only; none need a database (config, logging, pool config and retry, router and health handlers, serve and shutdown). There are no integration tests yet.
+- **Backend unit tests:** `cd backend && go test ./...` (or `go test -race ./...`). These are unit tests only; none need a running PostgreSQL (config, logging, pool config and retry, router and health handlers, serve and shutdown).
+- **Backend integration tests:** files tagged `//go:build integration` (`internal/database/postgres_integration_test.go`, `internal/health/handler_integration_test.go`) require a reachable PostgreSQL:
+  - Run them from `backend/` with `go test -tags=integration ./...`, or with the race detector twice: `go test -race -tags=integration -count=2 ./...`. Vet them with `go vet -tags=integration ./...` (plain `go vet ./...` skips them).
+  - Configure them only through environment variables. Required: `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_NAME`, `TEST_DB_USER`, `TEST_DB_PASSWORD`. Optional: `TEST_DB_SSLMODE` (default `disable`). They never load `.env` or read the app's `POSTGRES_*`/`DB_*` variables, and fail (not skip) when a required variable is missing.
+  - Their pools use `MaxConns=2` and `MinConns=2`. They are read-only (`SELECT`, `SHOW`, `pg_sleep`, `pg_stat_activity`): no tables, writes or `SET`. Keep them that way.
+  - Point them at a dedicated test database, never a production one, e.g. one created with `docker compose exec postgres sh -c 'createdb -U "$POSTGRES_USER" safeinsiam_test'`. Never commit real database credentials, and never print or expose `TEST_DB_PASSWORD`.
+  - CI: the Backend job starts a `postgres:17-alpine` service with test-only credentials. `TEST_DB_*` is set only on the integration test step; the unit tests run separately without it.
 - **Frontend tests:** none. There is no test framework or script.
 - **Linting:** no lint script yet. `@nuxt/eslint` is installed but isn't in `nuxt.config.ts` modules, and there's no `eslint.config.*`.
 

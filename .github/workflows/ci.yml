@@ -16,6 +16,22 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    services:
+      # Test-only database for the integration tests. These credentials are
+      # throwaway values for this runner, not secrets.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: safeinsiam_test
+          POSTGRES_USER: safeinsiam_test
+          POSTGRES_PASSWORD: safeinsiam_test_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U safeinsiam_test -d safeinsiam_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -32,8 +48,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Vet integration tests
+        run: go vet -tags=integration ./...
+
       - name: Test
         run: go test ./...
+
+      - name: Integration test
+        run: go test -tags=integration ./...
+        env:
+          TEST_DB_HOST: 127.0.0.1
+          TEST_DB_PORT: "5432"
+          TEST_DB_NAME: safeinsiam_test
+          TEST_DB_USER: safeinsiam_test
+          TEST_DB_PASSWORD: safeinsiam_test_only
+          TEST_DB_SSLMODE: disable
 
       - name: Build
         run: go build ./...
