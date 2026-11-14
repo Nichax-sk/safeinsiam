@@ -13,6 +13,7 @@ jobs:
   backend:
     name: Backend (Go)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -35,6 +36,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -45,6 +48,18 @@ jobs:
       - name: Download modules
         run: go mod download
 
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check modules
+        run: go mod tidy -diff
+
       - name: Vet
         run: go vet ./...
 
@@ -54,8 +69,11 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # -count=1: the test cache doesn't track database state, so cached
+      # results could pass without reaching PostgreSQL. The unit tests ran
+      # in the previous step, so only TestIntegration* tests run here.
       - name: Integration test
-        run: go test -tags=integration ./...
+        run: go test -count=1 -tags=integration -run '^TestIntegration' ./...
         env:
           TEST_DB_HOST: 127.0.0.1
           TEST_DB_PORT: "5432"
@@ -70,12 +88,15 @@ jobs:
   frontend:
     name: Frontend (Nuxt)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: frontend
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -83,11 +104,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
-      - name: Check Node.js and npm versions
-        run: |
-          node --version
-          npm --version
 
       - name: Install dependencies
         run: npm ci
