@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/Nichax-sk/safeinsiam/internal/config"
 	"github.com/Nichax-sk/safeinsiam/internal/health"
@@ -202,6 +204,99 @@ func TestRunReturnsErrorWhenContextCancelledBeforeDatabase(t *testing.T) {
 	err := Run(ctx, cfg, discardLogger())
 	if err == nil {
 		t.Fatal("Run succeeded with a cancelled context")
+	}
+}
+
+// fatalStartupServer answers every connection's startup message with resp
+// and returns its port.
+func fatalStartupServer(t *testing.T, resp *pgproto3.ErrorResponse) int {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			b := pgproto3.NewBackend(conn, conn)
+			if _, err := b.ReceiveStartupMessage(); err == nil {
+				b.Send(resp)
+				_ = b.Flush()
+			}
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		<-done
+	})
+
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// TestRunStartupErrorIsSafe checks the error Run returns for a failed
+// database startup, which main logs as is: it holds no driver text, host,
+// user, database or password, so app.go and main.go need no redaction.
+func TestRunStartupErrorIsSafe(t *testing.T) {
+	port := fatalStartupServer(t, &pgproto3.ErrorResponse{
+		Severity:      "FATAL",
+		Code:          "28P01",
+		Message:       "sentinel_message for user sentinel_user",
+		Detail:        "sentinel_detail",
+		Hint:          "sentinel_hint",
+		InternalQuery: "SELECT sentinel_query",
+	})
+
+	cfg := &config.Config{
+		Env:  config.EnvTest,
+		HTTP: config.HTTP{Host: "127.0.0.1", Port: 1, ShutdownTimeout: time.Second},
+		Database: config.Database{
+			Host:     "127.0.0.1",
+			Port:     port,
+			Name:     "sentinel_db",
+			User:     "sentinel_user",
+			Password: "sentinel_password",
+			SSLMode:  "disable",
+			MaxConns: 1,
+		},
+	}
+
+	var logs bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := Run(ctx, cfg, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err == nil {
+		t.Fatal("Run succeeded against a server that rejects authentication")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Run took %v; a non-retryable startup error should stop at once", elapsed)
+	}
+	if want := "initialize database: connect to postgres: after 1 attempt: unavailable (sqlstate 28P01)"; err.Error() != want {
+		t.Errorf("Run error = %q, want %q", err.Error(), want)
+	}
+
+	// The line main writes for this error, in both log formats.
+	var jsonLine, textLine bytes.Buffer
+	slog.New(slog.NewJSONHandler(&jsonLine, nil)).Error("SafeInSiam API stopped with error", "error", err)
+	slog.New(slog.NewTextHandler(&textLine, nil)).Error("SafeInSiam API stopped with error", "error", err)
+
+	for where, text := range map[string]string{
+		"error": err.Error(), "%+v": fmt.Sprintf("%+v", err), "run log": logs.String(),
+		"main log (json)": jsonLine.String(), "main log (text)": textLine.String(),
+	} {
+		for _, forbidden := range []string{"sentinel", "127.0.0.1", "SELECT"} {
+			if strings.Contains(text, forbidden) {
+				t.Errorf("%s contains %q: %s", where, forbidden, text)
+			}
+		}
 	}
 }
 

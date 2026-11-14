@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,11 +26,27 @@ const (
 	pingTimeout       = 5 * time.Second
 	retryInitialDelay = 500 * time.Millisecond
 	retryMaxDelay     = 4 * time.Second
+
+	// maxErrorTypeNames caps the Go type names logged for a retried error.
+	maxErrorTypeNames = 8
+)
+
+// Operations reported in startup errors.
+const (
+	opParseConfig = "parse database config"
+	opCreatePool  = "create database pool"
+	opConnect     = "connect to postgres"
 )
 
 // NewPostgresPool creates a connection pool and waits until PostgreSQL
-// answers a ping, retrying with backoff. It gives up after a bounded number
-// of attempts or as soon as ctx is cancelled.
+// answers a ping, retrying with backoff while IsRetryable reports the ping
+// error as retryable. It gives up at the first error that isn't, after a
+// bounded number of attempts, or as soon as ctx is cancelled.
+//
+// Every error it returns is a *startupError, whose text names only the
+// operation, attempts, kind and SQLSTATE: never the driver's message, the
+// host, user, database or password. The driver error stays available
+// through errors.Is, errors.As and Classify.
 func NewPostgresPool(
 	ctx context.Context,
 	cfg config.Database,
@@ -37,12 +54,12 @@ func NewPostgresPool(
 ) (*pgxpool.Pool, error) {
 	poolConfig, err := buildPoolConfig(cfg)
 	if err != nil {
-		return nil, err
+		return nil, newStartupError(opParseConfig, 0, err)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
-		return nil, fmt.Errorf("create database pool: %w", err)
+		return nil, newStartupError(opCreatePool, 0, err)
 	}
 
 	ping := func(ctx context.Context) error {
@@ -52,20 +69,29 @@ func NewPostgresPool(
 		return pool.Ping(pingCtx)
 	}
 
+	// The error's text can name the host, user and database and carry
+	// server messages, so only its classification and type names are logged.
 	onRetry := func(attempt int, wait time.Duration, err error) {
-		logger.Warn("database not ready, retrying",
+		class := Classify(err)
+		attrs := []any{
 			"attempt", attempt,
 			"max_attempts", connectAttempts,
 			"retry_in", wait,
-			"error", err,
-		)
+			"kind", class.Kind.String(),
+		}
+		if class.SQLState != "" {
+			attrs = append(attrs, "sqlstate", class.SQLState)
+		}
+		attrs = append(attrs, "error_type", errorTypeNames(err))
+		logger.Warn("database not ready, retrying", attrs...)
 	}
 
-	if err := retry(
-		ctx, connectAttempts, retryInitialDelay, retryMaxDelay, ping, onRetry,
-	); err != nil {
+	attempts, err := retry(
+		ctx, connectAttempts, retryInitialDelay, retryMaxDelay, ping, IsRetryable, onRetry,
+	)
+	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("connect to postgres: %w", err)
+		return nil, newStartupError(opConnect, attempts, err)
 	}
 
 	return pool, nil
@@ -84,8 +110,9 @@ func buildPoolConfig(cfg config.Database) (*pgxpool.Config, error) {
 
 	poolConfig, err := pgxpool.ParseConfig(connURL.String())
 	if err != nil {
-		// pgx redacts the password in parse errors.
-		return nil, fmt.Errorf("parse database config: %w", err)
+		// The error's text holds the connection string; NewPostgresPool
+		// wraps it in a startupError, which never shows that text.
+		return nil, err
 	}
 
 	poolConfig.MaxConns = cfg.MaxConns
@@ -106,27 +133,33 @@ func buildPoolConfig(cfg config.Database) (*pgxpool.Config, error) {
 }
 
 // retry calls fn up to attempts times, doubling the wait between attempts
-// from delay up to maxDelay. It returns early when ctx is cancelled.
+// from delay up to maxDelay. It stops early at the first error retryable
+// rejects, or when ctx is cancelled. It returns the number of attempts made
+// and the last error: fn's, or ctx's when ctx ended the retries.
 func retry(
 	ctx context.Context,
 	attempts int,
 	delay, maxDelay time.Duration,
 	fn func(context.Context) error,
+	retryable func(error) bool,
 	onRetry func(attempt int, wait time.Duration, err error),
-) error {
-	var err error
-
+) (int, error) {
 	for attempt := 1; ; attempt++ {
-		if err = fn(ctx); err == nil {
-			return nil
+		err := fn(ctx)
+		if err == nil {
+			return attempt, nil
 		}
 
 		if attempt >= attempts {
-			return fmt.Errorf("after %d attempts: %w", attempt, err)
+			return attempt, err
 		}
 
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("after %d attempts: %w", attempt, ctxErr)
+			return attempt, ctxErr
+		}
+
+		if !retryable(err) {
+			return attempt, err
 		}
 
 		onRetry(attempt, delay, err)
@@ -135,10 +168,86 @@ func retry(
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("after %d attempts: %w", attempt, ctx.Err())
+			return attempt, ctx.Err()
 		case <-timer.C:
 		}
 
 		delay = min(delay*2, maxDelay)
 	}
+}
+
+// startupError is an error from NewPostgresPool. Its text is built only from
+// the operation, the number of attempts, the error's kind and its SQLSTATE,
+// never from the wrapped error's text, which can name the host, user and
+// database and carry server messages. Unwrap keeps the wrapped error
+// available to errors.Is, errors.As and Classify.
+type startupError struct {
+	op       string
+	attempts int // 0 when no ping was attempted
+	class    Classification
+	err      error
+}
+
+func newStartupError(op string, attempts int, err error) *startupError {
+	return &startupError{op: op, attempts: attempts, class: Classify(err), err: err}
+}
+
+// Error returns, for example,
+// "connect to postgres: after 1 attempt: unavailable (sqlstate 28P01)".
+func (e *startupError) Error() string {
+	var b strings.Builder
+	b.WriteString(e.op)
+	b.WriteString(": ")
+	if e.attempts > 0 {
+		b.WriteString("after ")
+		b.WriteString(strconv.Itoa(e.attempts))
+		if e.attempts == 1 {
+			b.WriteString(" attempt: ")
+		} else {
+			b.WriteString(" attempts: ")
+		}
+	}
+	b.WriteString(e.class.Kind.String())
+	if e.class.SQLState != "" {
+		b.WriteString(" (sqlstate ")
+		b.WriteString(e.class.SQLState)
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
+func (e *startupError) Unwrap() error {
+	return e.err
+}
+
+// errorTypeNames returns the Go type names in err's chain, depth first, at
+// most maxErrorTypeNames, joined with commas. Type names come from code, not
+// data, so they are safe to log. It calls no method other than Unwrap, and
+// returns "" for a chain walkChain rejects (a typed-nil error, a cycle or an
+// oversized chain).
+func errorTypeNames(err error) string {
+	if err == nil || !walkChain(err) {
+		return ""
+	}
+
+	var names []string
+	var walk func(error)
+	walk = func(err error) {
+		if err == nil || len(names) >= maxErrorTypeNames {
+			return
+		}
+		names = append(names, fmt.Sprintf("%T", err))
+
+		switch unwrapper := err.(type) {
+		case interface{ Unwrap() error }:
+			walk(unwrapper.Unwrap())
+		case interface{ Unwrap() []error }:
+			for _, inner := range unwrapper.Unwrap() {
+				walk(inner)
+			}
+		}
+	}
+	walk(err)
+
+	return strings.Join(names, ",")
 }

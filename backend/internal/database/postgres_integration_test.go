@@ -19,12 +19,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Nichax-sk/safeinsiam/internal/config"
@@ -379,131 +377,22 @@ func TestIntegrationUnreachableTargetFails(t *testing.T) {
 	})
 }
 
-// failingPingServer is a fake PostgreSQL server for many connections. It
-// completes startup and then fails every query with an ERROR followed by
-// ReadyForQuery('I'), so pgxpool keeps each connection open and idle. It
-// never closes a connection first: a connection ends only when the client
-// closes it, or at test cleanup.
-type failingPingServer struct {
-	port int
-
-	mu         sync.Mutex
-	conns      []*fakeServerConn
-	lastAccept time.Time
-}
-
-type fakeServerConn struct {
-	net.Conn
-	// closedByClient is closed once a read fails: the client closed the
-	// connection.
-	closedByClient chan struct{}
-}
-
-func newFailingPingServer(t *testing.T) *failingPingServer {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	s := &failingPingServer{port: ln.Addr().(*net.TCPAddr).Port}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			c := &fakeServerConn{Conn: conn, closedByClient: make(chan struct{})}
-
-			s.mu.Lock()
-			s.conns = append(s.conns, c)
-			s.lastAccept = time.Now()
-			s.mu.Unlock()
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				s.serve(c)
-			}()
-		}
-	}()
-
-	t.Cleanup(func() {
-		ln.Close()
-		s.mu.Lock()
-		for _, c := range s.conns {
-			c.Close()
-		}
-		s.mu.Unlock()
-		wg.Wait()
-	})
-
-	return s
-}
-
-func (s *failingPingServer) serve(c *fakeServerConn) {
-	defer close(c.closedByClient)
-
-	b := pgproto3.NewBackend(c, c)
-	if _, err := b.ReceiveStartupMessage(); err != nil {
-		return
-	}
-	b.Send(&pgproto3.AuthenticationOk{})
-	b.Send(&pgproto3.BackendKeyData{ProcessID: 1, SecretKey: []byte{0, 0, 0, 1}})
-	b.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
-	if err := b.Flush(); err != nil {
-		return
-	}
-
-	for {
-		msg, err := b.Receive()
-		if err != nil {
-			return
-		}
-		switch msg.(type) {
-		case *pgproto3.Query, *pgproto3.Sync:
-			b.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "XX000", Message: "ping rejected"})
-			b.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
-			if err := b.Flush(); err != nil {
-				return
-			}
-		}
-		// Terminate and anything else: keep reading until the client
-		// closes the connection.
-	}
-}
-
-// state reports how many connections were accepted, how many the client has
-// not closed, and how long ago the last one was accepted.
-func (s *failingPingServer) state() (accepted, open int, quiet time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, c := range s.conns {
-		select {
-		case <-c.closedByClient:
-		default:
-			open++
-		}
-	}
-	return len(s.conns), open, time.Since(s.lastAccept)
-}
-
 // TestIntegrationFailedPoolClosesSockets checks that a pool whose startup
 // ping fails closes every socket it opened. It proves only that those
 // sockets were closed by the client, not that every goroutine or timer was
 // released. It needs no real database.
 //
+// The fake server is newFailingPingServer, in fakeserver_test.go. The
+// rejected ping (XX000) is not retryable, so NewPostgresPool stops after the
+// first attempt.
+//
 // Mutation check: in an overlay copy of postgres.go, delete only the
 // pool.Close() in the retry-failure branch of NewPostgresPool:
 //
-//	if err := retry(...); err != nil {
+//	attempts, err := retry(...)
+//	if err != nil {
 //		pool.Close() // delete this line
-//		return nil, fmt.Errorf("connect to postgres: %w", err)
+//		return nil, newStartupError(opConnect, attempts, err)
 //	}
 //
 // then run

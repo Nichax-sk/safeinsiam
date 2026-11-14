@@ -54,7 +54,7 @@ Layout:
 - `internal/httpapi/decode.go`: `DecodeJSON(c, dst)` and `MaxJSONBodyBytes`, the only way handlers read a JSON request body (see Request bodies below).
 - `internal/health/handler.go`: `Register(r, db Pinger)` adds the health routes at `PathLive` (`/health`) and `PathDB` (`/health/db`). `Routes` lists both, for logging configuration.
 - `internal/config/config.go`: reads and validates environment variables, reporting every error at once. Outside production it reads an env file (`ENV_FILE`, default `../.env` relative to the working directory) without modifying the process environment. Non-empty process variables take precedence over file values.
-- `internal/database/postgres.go`: `NewPostgresPool` builds the pgx config from a `net/url` URL (never a formatted DSN), sets `application_name` and `statement_timeout`, and pings with bounded retry: 5 attempts, backoff 0.5s→4s, cancelled by `ctx`. MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m.
+- `internal/database/postgres.go`: `NewPostgresPool` builds the pgx config from a `net/url` URL (never a formatted DSN), sets `application_name` and `statement_timeout`, and pings with bounded retry: 5 attempts, backoff 0.5s→4s, cancelled by `ctx`, and stopped at the first ping error `database.IsRetryable` rejects. MaxConnLifetime 1h, MaxConnIdleTime 30m, HealthCheckPeriod 1m. Every error it returns is safe to log (see Database errors below).
 - `internal/database/errors.go`: `Classify` and `IsRetryable` for pgx/PostgreSQL errors (see Database errors below).
 - `internal/logging/logging.go`: `log/slog` logger. Text in development and test, JSON in staging and production.
 
@@ -181,14 +181,14 @@ Database errors (`database/errors.go`, `httpapi/dberror.go`):
   - a `*pgconn.ConnectError` with no `PgError` in its chain, or `pgconn.SafeToRetry`.
 
   Not retryable: class 08 (`08000`–`08007`), `57P01`, `57P02`, `53000`, `53200`, `40003`, `57014`, other timeouts and network errors. Unknown codes and errors are not marked retryable.
-- **No automatic retries.** `IsRetryable` only reports; the startup ping's own bounded retry is separate and unchanged.
+- **No automatic retries,** except the startup ping in `NewPostgresPool`. That retry asks `IsRetryable` (its only retry decision; no rules are duplicated) and keeps 5 attempts with backoff 0.5s→1s→2s→4s. A non-retryable error stops it at once: authentication (`28P01`), a missing database (`3D000`), shutdown, a failed ping query, and a ping deadline (5s) that expires after the connection is up or while pgxpool is still connecting (the bare context error proves nothing about what was sent). Refused or unresolvable connections and `57P03`/`53300` at startup are retried.
 - **`httpapi.DatabaseError(err)`** maps for `WriteError`: not_found → 404, conflict (`23505`, `23503`, `23P01`, `23001`) → 409, contention/unavailable/timeout/canceled → 503 `service_unavailable`, unknown (including `23502`, `23514`, `22xxx`) → 500. It uses default messages and no details, and keeps the error as the cause.
 - **Existing API errors:** `DatabaseError` first searches the chain, depth first in `errors.As` order, for a non-nil `*httpapi.Error`, and returns the error unchanged if it finds one.
   - Shared identified errors are searched once.
   - The search stops on a cycle, or when it exceeds the search budget.
   - If the search stops before finding an `*httpapi.Error`, `DatabaseError` wraps the original error as `internal_error`.
 - **Disclosure:** raw error and driver text are never written to request logs or API responses: no PostgreSQL messages, details, hints, SQL, schema/table/column/constraint names, hosts or users. 5xx request-log entries represent the error only by its `error_code` and the Go type names in its chain.
-  - **Exception, startup logs:** `database not ready, retrying` and the final startup error print pgx error text. It can include the DB host, user and database name, but never the password.
+  - **Startup logs and errors:** the same holds at startup. `database not ready, retrying` logs `attempt`, `max_attempts`, `retry_in`, `kind`, `sqlstate` (when set) and `error_type` (Go type names in the chain), never the error. Every error `NewPostgresPool` returns has a fixed-form text, e.g. `connect to postgres: after 1 attempt: unavailable (sqlstate 28P01)` or `parse database config: unknown`, so `app.Run` and `main` log it unchanged without leaking the host, user, database, password or connection string. The driver error stays reachable through `errors.Is`, `errors.As` and `Classify`; never log `errors.Unwrap` of it.
 
 Known gaps:
 
