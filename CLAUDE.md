@@ -11,7 +11,7 @@ SafeInSiam is a monorepo laid out as follows:
 - `docker-compose.yml` (repo root): defines the PostgreSQL service
 - `database/`: set aside for database-related files. It currently holds only the empty `migrations/` and `seeds/` folders.
 
-The project is an early scaffold. The backend has only health-check endpoints and the frontend has one placeholder page. Product features and requirements are not defined in the repo yet, so don't assume them.
+The project is an early scaffold. The backend has only health-check endpoints and the frontend has one placeholder page. The approved MVP product scope, requirements and proposed API contract are documented in `docs/` (start at `docs/README.md`). They are not implemented yet: don't assume anything beyond what those documents state, and treat their open questions as undecided.
 
 ## 2. Frontend (`frontend/`)
 
